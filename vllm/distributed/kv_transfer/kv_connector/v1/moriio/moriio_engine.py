@@ -379,7 +379,16 @@ class MoRIIOWrapper:
             num_worker_threads,
             poll_mode,
         )
-        self.moriio_engine.create_backend(backend_type, rdma_cfg)
+        try:
+            self.moriio_engine.create_backend(backend_type, rdma_cfg)
+        except RuntimeError as e:
+            logger.warning(
+                "Backend %s creation failed: %s. "
+                "xGMI backend may still be available for "
+                "single-node transfers.",
+                backend_type,
+                e,
+            )
 
     def get_agent_metadata(self):
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
