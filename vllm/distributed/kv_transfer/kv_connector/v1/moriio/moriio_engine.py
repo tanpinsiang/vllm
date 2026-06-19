@@ -599,6 +599,7 @@ class MoRIIOWrapper:
         # Decode Role:
         #   [write] mode: receives KV cache write completion notifications
         handled = False
+        msg_str = repr(msg)
         try:
             data = msgpack.loads(msg)
             if isinstance(data, dict) and "req_id" in data:
@@ -607,15 +608,15 @@ class MoRIIOWrapper:
                 return
         except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
             logger.debug("Failed to decode msgpack message, will try as string")
-            pass
 
         try:
             msg_str = msg.decode("UTF-8")
             if msg_str.startswith(MoRIIOConstants.TRANSFER_PREFIX):
                 self._handle_completion_message(msg_str)
                 handled = True
-        except UnicodeDecodeError:
-            logger.warning("Received non-UTF8 message: %s", msg_str)
+        except UnicodeDecodeError as e:
+            logger.warning("Received non-UTF8 message: %r", msg)
+            raise MoRIIOError("Unhandled non-UTF8 message") from e
         if not handled:
             raise MoRIIOError(f"Unhandled message format: {msg_str}")
 
@@ -671,9 +672,11 @@ class MoRIIOWrapper:
             raise
 
     def pop_finished_req_ids(self):
-        # producer invocation: get the set of completed requests at the decode
+        # Producer invocation: preserve every completion message. In
+        # heterogeneous-TP READ mode, multiple decode ranks can send the same
+        # transfer_id and the producer must count each ACK.
         with self.lock:
-            done_send = set(self.done_req_ids)
+            done_send = list(self.done_req_ids)
             self.done_req_ids = []
         return done_send
 

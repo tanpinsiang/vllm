@@ -6,8 +6,9 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgpack
 import msgspec
@@ -96,6 +97,118 @@ except ImportError:
 
 def is_moriio_available() -> bool:
     return MoRIIO_enabled
+
+
+class MoRIIOTransferAck(NamedTuple):
+    transfer_id: TransferId
+    consumer_tp_size: int
+
+
+def get_moriio_remote_tp_rank(
+    local_tp_rank: int, local_tp_size: int, remote_tp_size: int
+) -> int:
+    if local_tp_size <= 0 or remote_tp_size <= 0:
+        raise ValueError("TP sizes must be positive")
+    if local_tp_rank < 0 or local_tp_rank >= local_tp_size:
+        raise ValueError(
+            f"local_tp_rank {local_tp_rank} must be in [0, {local_tp_size})"
+        )
+    if remote_tp_size == local_tp_size:
+        return local_tp_rank
+    if remote_tp_size > local_tp_size:
+        if remote_tp_size % local_tp_size != 0:
+            raise ValueError(
+                f"remote tp_size {remote_tp_size} must be a multiple of local "
+                f"tp_size {local_tp_size} for heterogeneous-TP P/D"
+            )
+        return local_tp_rank * (remote_tp_size // local_tp_size)
+    if local_tp_size % remote_tp_size != 0:
+        raise ValueError(
+            f"local tp_size {local_tp_size} must be a multiple of remote "
+            f"tp_size {remote_tp_size} for heterogeneous-TP P/D"
+        )
+    return local_tp_rank // (local_tp_size // remote_tp_size)
+
+
+def validate_moriio_heterogeneous_tp_kv_heads(
+    local_tp_size: int,
+    remote_tp_size: int,
+    total_num_kv_heads: int,
+    is_mla: bool,
+) -> None:
+    if is_mla or local_tp_size == remote_tp_size:
+        return
+    if local_tp_size <= 0 or remote_tp_size <= 0 or total_num_kv_heads <= 0:
+        raise ValueError("TP sizes and total_num_kv_heads must be positive")
+    if min(local_tp_size, remote_tp_size) >= total_num_kv_heads:
+        return
+    raise NotImplementedError(
+        "MoRIIO heterogeneous TP requires replicated KV heads on both "
+        f"prefill and decode. Got total_num_kv_heads={total_num_kv_heads}, "
+        f"local_tp_size={local_tp_size}, remote_tp_size={remote_tp_size}."
+    )
+
+
+def format_moriio_transfer_ack(
+    transfer_id: TransferId, consumer_tp_size: int
+) -> str:
+    if consumer_tp_size <= 0:
+        raise ValueError("consumer_tp_size must be positive")
+    return f"{transfer_id}:{consumer_tp_size}"
+
+
+def parse_moriio_transfer_ack(raw_msg: str) -> MoRIIOTransferAck:
+    transfer_id, sep, tp_size_str = raw_msg.rpartition(":")
+    if not sep:
+        return MoRIIOTransferAck(raw_msg, 1)
+    try:
+        consumer_tp_size = int(tp_size_str)
+    except ValueError:
+        return MoRIIOTransferAck(raw_msg, 1)
+    if consumer_tp_size <= 0:
+        raise ValueError(f"Invalid consumer tp_size {consumer_tp_size}")
+    return MoRIIOTransferAck(transfer_id, consumer_tp_size)
+
+
+def get_moriio_expected_ack_count(
+    producer_tp_size: int, consumer_tp_size: int
+) -> int:
+    if producer_tp_size <= 0 or consumer_tp_size <= 0:
+        raise ValueError("TP sizes must be positive")
+    if consumer_tp_size <= producer_tp_size:
+        return 1
+    if consumer_tp_size % producer_tp_size != 0:
+        raise ValueError(
+            f"consumer tp_size {consumer_tp_size} must be a multiple of "
+            f"producer tp_size {producer_tp_size} for heterogeneous-TP P/D"
+        )
+    return consumer_tp_size // producer_tp_size
+
+
+def resolve_moriio_transfer_ack(
+    ack: MoRIIOTransferAck,
+    producer_tp_size: int,
+    live_transfer_ids: Collection[TransferId],
+    notification_counts: dict[TransferId, int],
+    completed_transfer_ids: set[TransferId],
+) -> TransferId | None:
+    transfer_id = ack.transfer_id
+    if transfer_id not in live_transfer_ids:
+        return None
+    if transfer_id in completed_transfer_ids:
+        return None
+
+    expected_acks = get_moriio_expected_ack_count(
+        producer_tp_size, ack.consumer_tp_size
+    )
+    count = notification_counts.get(transfer_id, 0) + 1
+    if count < expected_acks:
+        notification_counts[transfer_id] = count
+        return None
+
+    notification_counts.pop(transfer_id, None)
+    completed_transfer_ids.add(transfer_id)
+    return transfer_id
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
@@ -759,6 +872,11 @@ class MoRIIOConnectorWorker:
         # Completions that arrived before transfer_id_to_request_id was populated.
         # Retried each step until the mapping is established.
         self._unmatched_write_completions: set[str] = set()
+        # Producer side READ-mode ACK fan-in. When decode TP is larger than
+        # prefill TP, multiple decode ranks can read from one prefill rank and
+        # notify the same transfer_id. Blocks are reusable only after all ACKs.
+        self._consumer_notification_counts: dict[TransferId, int] = {}
+        self._completed_consumer_notifications: set[TransferId] = set()
 
         role = "producer" if self.is_producer else "consumer"
         engine_suffix = (
@@ -1122,7 +1240,9 @@ class MoRIIOConnectorWorker:
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
 
-        port_offset = get_port_offset(remote_dp_rank, self.tp_rank)
+        port_offset = get_port_offset(
+            remote_dp_rank, self._remote_tp_rank(remote_tp_size)
+        )
         path = make_zmq_path("tcp", host, port + port_offset)
         logger.debug("handshake Querying metadata on path: %s", path)
 
@@ -1187,18 +1307,19 @@ class MoRIIOConnectorWorker:
 
         return {remote_agent_name}
 
+    def _remote_tp_rank(self, remote_tp_size: int) -> int:
+        return get_moriio_remote_tp_rank(
+            self.tp_rank, self.world_size, remote_tp_size
+        )
+
     def _background_moriio_handshake(
         self, req_id: ReqId, remote_engine_id: EngineId, meta: ReqMeta
     ):
         # Do MoRIIO handshake in background and add to _ready_requests when done.
-        fut = None
-        if remote_engine_id is not None:
-            fut = self._handshake_futures.get(remote_engine_id)
-        if fut is None:
-            host = meta.remote_host
-            port = int(meta.remote_handshake_port)
-            tp_size = int(meta.tp_size)
-            remote_dp_size = int(meta.remote_dp_size)
+        host = meta.remote_host
+        port = int(meta.remote_handshake_port)
+        tp_size = int(meta.tp_size)
+        remote_dp_size = int(meta.remote_dp_size)
 
         def request_ready(_f: Future[Any], entry=(req_id, meta)):
             logger.info("MoRIIO handshake done for request %s", req_id)
@@ -1212,9 +1333,19 @@ class MoRIIOConnectorWorker:
 
         for cur_dp_rank in range(remote_dp_size):
             dp_engine_id = self.get_engine_name_with_dp(remote_engine_id, cur_dp_rank)
-            future = self._handshake_initiation_executor.submit(
-                self._moriio_handshake, host, port, tp_size, dp_engine_id, cur_dp_rank
-            )
+            with self._handshake_lock:
+                future = self._handshake_futures.get(dp_engine_id)
+                add_done_callback = future is None
+                if future is None:
+                    future = self._handshake_initiation_executor.submit(
+                        self._moriio_handshake,
+                        host,
+                        port,
+                        tp_size,
+                        dp_engine_id,
+                        cur_dp_rank,
+                    )
+                    self._handshake_futures[dp_engine_id] = future
             fut_list.append(future)
 
             def done_callback(f: Future[set[str]], eid=dp_engine_id):
@@ -1225,8 +1356,8 @@ class MoRIIOConnectorWorker:
                     except Exception:
                         logger.exception("Handshake with %s failed", eid)
 
-            future.add_done_callback(done_callback)
-            self._handshake_futures[dp_engine_id] = future
+            if add_done_callback:
+                future.add_done_callback(done_callback)
 
         # fut = fut_list
         def wait_all_dp():
@@ -1396,13 +1527,38 @@ class MoRIIOConnectorWorker:
         done_sending, done_recving = set(), set()
 
         if self.is_producer:
-            # pop_finished_req_ids returns transfer_ids (the ZMQ payload sent
-            # by decode via send_notify); map back to req_ids for the scheduler.
-            finished_transfer_ids = self.moriio_wrapper.pop_finished_req_ids()
+            # pop_finished_req_ids returns completion messages sent by decode.
+            # They may contain duplicate transfer_ids in heterogeneous-TP
+            # READ mode, so preserve every occurrence for ACK fan-in.
+            finished_transfer_msgs = self.moriio_wrapper.pop_finished_req_ids()
+            resolved_transfer_ids: set[TransferId] = set()
+            for raw_msg in finished_transfer_msgs:
+                try:
+                    ack = parse_moriio_transfer_ack(raw_msg)
+                    if ack.transfer_id not in self.transfer_id_to_request_id:
+                        logger.warning(
+                            "Could not find %s in transfer_id_to_request_id "
+                            "lookup table. This could lead to a possible hang.",
+                            ack.transfer_id,
+                        )
+                        continue
+                    resolved_transfer_id = resolve_moriio_transfer_ack(
+                        ack,
+                        self.world_size,
+                        self.transfer_id_to_request_id.keys(),
+                        self._consumer_notification_counts,
+                        self._completed_consumer_notifications,
+                    )
+                except ValueError:
+                    logger.exception(
+                        "Invalid MoRIIO completion notification: %s", raw_msg
+                    )
+                    continue
+                if resolved_transfer_id is not None:
+                    resolved_transfer_ids.add(resolved_transfer_id)
             done_sending = {
                 self.transfer_id_to_request_id[xfer_id]
-                for xfer_id in finished_transfer_ids
-                if xfer_id in self.transfer_id_to_request_id
+                for xfer_id in resolved_transfer_ids
             }
         else:
             if self.mode == MoRIIOMode.WRITE:
@@ -1447,7 +1603,11 @@ class MoRIIOConnectorWorker:
                 if last.Succeeded():
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
-                    self.moriio_wrapper.send_notify(xfer_id, host, port)
+                    self.moriio_wrapper.send_notify(
+                        format_moriio_transfer_ack(xfer_id, self.world_size),
+                        host,
+                        port,
+                    )
                     to_remove.append(req_id)
                 elif last.Failed():
                     logger.error(
@@ -1460,7 +1620,11 @@ class MoRIIOConnectorWorker:
                     )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
-                        self.moriio_wrapper.send_notify(xfer_id, host, port)
+                        self.moriio_wrapper.send_notify(
+                            format_moriio_transfer_ack(xfer_id, self.world_size),
+                            host,
+                            port,
+                        )
                     except Exception:
                         logger.exception(
                             "Failed to send error notification for request %s",
@@ -1500,13 +1664,8 @@ class MoRIIOConnectorWorker:
             dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
             if dp0_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
-                with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
-                        self._background_moriio_handshake(
-                            req_id, remote_engine_id, meta
-                        )
-
-                        continue
+                self._background_moriio_handshake(req_id, remote_engine_id, meta)
+                continue
             self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
         if remote_engine_id is None:
@@ -1546,6 +1705,15 @@ class MoRIIOConnectorWorker:
         """
         self.transfer_id_to_request_id = metadata.transfer_id_to_request_id
         if self.is_producer:
+            live_transfer_ids = set(self.transfer_id_to_request_id)
+            self._consumer_notification_counts = {
+                transfer_id: count
+                for transfer_id, count in self._consumer_notification_counts.items()
+                if transfer_id in live_transfer_ids
+            }
+            self._completed_consumer_notifications.intersection_update(
+                live_transfer_ids
+            )
             self.moriio_wrapper.async_wait_reqid()
             return
         if self.mode == MoRIIOMode.WRITE:
@@ -1562,14 +1730,9 @@ class MoRIIOConnectorWorker:
             dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
             if dp0_remote_engine_id not in self._remote_agents:
                 # Initiate handshake with remote engine to exchange metadata.
-                with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
-                        self._background_moriio_handshake(
-                            req_id, remote_engine_id, meta
-                        )
-                        wait_handshake_readd_req = True
-
-                        continue
+                self._background_moriio_handshake(req_id, remote_engine_id, meta)
+                wait_handshake_readd_req = True
+                continue
 
             # Handshake already completed, start async read xfer.
             self._read_blocks_for_req(req_id, meta)
@@ -1618,6 +1781,7 @@ class MoRIIOConnectorWorker:
             remote_block_ids=meta.remote_block_ids,
             remote_host=meta.remote_host,
             remote_notify_port=meta.remote_notify_port,
+            remote_tp_size=meta.tp_size,
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -1711,6 +1875,7 @@ class MoRIIOConnectorWorker:
         local_block_ids: list[int],
         remote_block_ids: list[int],
         remote_moriio_meta: MoRIIOAgentMetadata,
+        remote_tp_size: int | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
         """Compute transfer offsets for block data.
 
@@ -1719,9 +1884,16 @@ class MoRIIOConnectorWorker:
             local_block_ids: IDs of local blocks
             remote_block_ids: IDs of remote blocks
             remote_moriio_meta: Metadata of the remote MoRIIO agent
+            remote_tp_size: TP size of the remote engine
         Returns:
             Tuple of (local_offsets, remote_offsets, transfer_sizes)
         """
+        validate_moriio_heterogeneous_tp_kv_heads(
+            self.world_size,
+            remote_tp_size if remote_tp_size is not None else self.world_size,
+            self.model_config.get_total_num_kv_heads(),
+            self._is_mla_cache_layer(layer_name),
+        )
         return compute_block_transfer_offsets(
             layer_name=layer_name,
             kv_cache=self.kv_caches[layer_name],
@@ -1743,6 +1915,7 @@ class MoRIIOConnectorWorker:
         transfer_id: str,
         remote_host: str,
         remote_notify_port: int,
+        remote_tp_size: int,
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
@@ -1755,7 +1928,11 @@ class MoRIIOConnectorWorker:
                 layer_name
             )
             offs = self._compute_block_transfer_offsets(
-                layer_name, local_block_ids, remote_block_ids, remote_moriio_meta
+                layer_name,
+                local_block_ids,
+                remote_block_ids,
+                remote_moriio_meta,
+                remote_tp_size=remote_tp_size,
             )
             # TODO : apply multi-session batch-read when moriio support it
             transfer_status = self.moriio_wrapper.read_remote_data(
@@ -1765,6 +1942,6 @@ class MoRIIOConnectorWorker:
                 self._recving_transfers[request_id].append(transfer_status)
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
-                    str(remote_notify_port + self.tp_rank),
+                    str(remote_notify_port + self._remote_tp_rank(remote_tp_size)),
                     transfer_id,
                 )
