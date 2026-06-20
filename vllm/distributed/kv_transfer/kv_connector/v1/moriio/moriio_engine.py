@@ -476,17 +476,46 @@ class MoRIIOWrapper:
     def get_unpack_memory_metadata(self, packed_memory_metadata):
         return MemoryDesc.unpack(packed_memory_metadata)
 
+    @staticmethod
+    def _describe_memory_metadata(memory_metadata) -> str:
+        fields = (
+            "engine_key",
+            "device_id",
+            "device_bus_id",
+            "loc",
+            "data",
+            "size",
+        )
+        return ", ".join(
+            f"{field}={getattr(memory_metadata, field, '<missing>')}"
+            for field in fields
+        )
+
     def build_session(self, local_memory_metadata, remote_memory_metadata):
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
-        return self.moriio_engine.create_session(
+        session = self.moriio_engine.create_session(
             local_memory_metadata, remote_memory_metadata
         )
+        if session is None:
+            local_desc = self._describe_memory_metadata(local_memory_metadata)
+            remote_desc = self._describe_memory_metadata(remote_memory_metadata)
+            raise MoRIIOError(
+                "MoRIIO create_session returned None. "
+                f"local=({local_desc}); remote=({remote_desc}). "
+                "This usually means the selected MoRIIO backend cannot create "
+                "a path between the two memory regions. For XGMI, verify that "
+                "the peer GPU is visible to the process creating the session; "
+                "use RDMA for split prefill/decode GPU visibility."
+            )
+        return session
 
     def read_remote_data(
         self, transfer_size_byte, local_offset=0, remote_offset=0, session=None
     ):
         assert self.local_memory_registered, "You have not register local memory data!"
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
+        if session is None:
+            raise MoRIIOError("MoRIIO read_remote_data requires a valid session")
         transfer_status = session.batch_read(
             local_offset,
             remote_offset,
@@ -501,6 +530,8 @@ class MoRIIOWrapper:
     ):
         assert self.local_memory_registered, "You have not register local memory data!"
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
+        if session is None:
+            raise MoRIIOError("MoRIIO write_remote_data requires a valid session")
         write_uid = self.moriio_engine.allocate_transfer_uid()
 
         transfer_status = session.batch_write(

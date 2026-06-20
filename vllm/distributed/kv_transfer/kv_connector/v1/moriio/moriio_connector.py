@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOConfig,
     MoRIIOConnectorMetadata,
     MoRIIOConstants,
+    MoRIIOError,
     MoRIIOMode,
     ReqId,
     ReqMeta,
@@ -1065,23 +1066,52 @@ class MoRIIOConnectorWorker:
 
     def _get_built_session(self, remote_engine_id):
         if remote_engine_id not in self.built_write_session:
+            if remote_engine_id not in self.layer_name_to_remote_kv_cache_metadata:
+                raise MoRIIOError(
+                    "Missing remote KV cache metadata for MoRIIO engine "
+                    f"{remote_engine_id}. Known engines: "
+                    f"{list(self.layer_name_to_remote_kv_cache_metadata)}"
+                )
+            if remote_engine_id not in self.remote_moriio_metadata:
+                raise MoRIIOError(
+                    "Missing remote MoRIIO agent metadata for engine "
+                    f"{remote_engine_id}. Known engines: "
+                    f"{list(self.remote_moriio_metadata)}"
+                )
+
             cur_remote_engine_sessions = []
+            remote_layer_metadata = self.layer_name_to_remote_kv_cache_metadata[
+                remote_engine_id
+            ]
             for ln, local_meta in self.layer_name_to_local_kv_cache_metadata.items():
+                if not local_meta:
+                    raise MoRIIOError(
+                        f"Missing local KV cache memory metadata for layer {ln}"
+                    )
+                if ln not in remote_layer_metadata or not remote_layer_metadata[ln]:
+                    raise MoRIIOError(
+                        "Missing remote KV cache memory metadata for layer "
+                        f"{ln} on engine {remote_engine_id}"
+                    )
                 unpacked_local_memory_meta = (
                     self.moriio_wrapper.get_unpack_memory_metadata(local_meta[0])
                 )
                 unpacked_remote_memory_meta = (
                     self.moriio_wrapper.get_unpack_memory_metadata(
-                        self.layer_name_to_remote_kv_cache_metadata[remote_engine_id][
-                            ln
-                        ][0]
+                        remote_layer_metadata[ln][0]
                     )
                 )
-                cur_remote_engine_sessions.append(
-                    self.moriio_wrapper.build_session(
+                try:
+                    session = self.moriio_wrapper.build_session(
                         unpacked_local_memory_meta, unpacked_remote_memory_meta
                     )
-                )
+                except MoRIIOError as e:
+                    raise MoRIIOError(
+                        "Failed to build MoRIIO session for layer "
+                        f"{ln} with remote engine {remote_engine_id} "
+                        f"using backend {self.moriio_config.backend!r}"
+                    ) from e
+                cur_remote_engine_sessions.append(session)
             self.built_write_session[remote_engine_id] = cur_remote_engine_sessions
         return self.built_write_session[remote_engine_id], self.remote_moriio_metadata[
             remote_engine_id

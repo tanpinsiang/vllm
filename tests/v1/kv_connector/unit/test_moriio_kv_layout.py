@@ -8,6 +8,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    MoRIIOError,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
+    MoRIIOWrapper,
+)
+
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 
 _REPO_ROOT = next(
@@ -154,6 +161,47 @@ def test_mixed_layers_compute_distinct_offsets_per_layer():
     assert separated != interleaved
     assert separated != indexer
     assert interleaved != indexer
+
+
+def test_build_session_rejects_none_session():
+    class FakeEngine:
+        def create_session(self, local_memory_metadata, remote_memory_metadata):
+            return None
+
+    local = SimpleNamespace(
+        engine_key="producer:tp0",
+        device_id=0,
+        device_bus_id="0000:05:00.0",
+        loc="GPU",
+        data=0x1000,
+        size=4096,
+    )
+    remote = SimpleNamespace(
+        engine_key="consumer:tp0",
+        device_id=0,
+        device_bus_id="0000:85:00.0",
+        loc="GPU",
+        data=0x2000,
+        size=4096,
+    )
+    wrapper = MoRIIOWrapper(moriio_engine=FakeEngine())
+
+    with pytest.raises(MoRIIOError, match="create_session returned None"):
+        wrapper.build_session(local, remote)
+
+
+@pytest.mark.parametrize("method_name", ["read_remote_data", "write_remote_data"])
+def test_transfer_requires_valid_session(method_name):
+    class FakeEngine:
+        def allocate_transfer_uid(self):
+            return 1
+
+    wrapper = MoRIIOWrapper(moriio_engine=FakeEngine())
+    wrapper.local_memory_registered = True
+    method = getattr(wrapper, method_name)
+
+    with pytest.raises(MoRIIOError, match="requires a valid session"):
+        method([1], [0], [0], session=None)
 
 
 def test_block_id_length_mismatch_raises_value_error():
