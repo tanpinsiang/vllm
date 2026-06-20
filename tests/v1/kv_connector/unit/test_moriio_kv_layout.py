@@ -11,6 +11,11 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOError,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
+    get_moriio_remote_tp_rank,
+    parse_moriio_transfer_ack,
+    resolve_moriio_transfer_ack,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
 )
@@ -277,3 +282,90 @@ def test_unsupported_shape_raises_value_error():
         moriio_layout.get_layer_transfer_geometry(
             "layer", cache, worker.layer_to_spec
         )
+
+
+def test_remote_tp_rank_maps_same_tp_to_same_rank():
+    assert [get_moriio_remote_tp_rank(rank, 4, 4) for rank in range(4)] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+
+
+def test_remote_tp_rank_maps_decode_tp8_to_prefill_tp4():
+    assert [get_moriio_remote_tp_rank(rank, 8, 4) for rank in range(8)] == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        2,
+        3,
+        3,
+    ]
+
+
+def test_remote_tp_rank_maps_decode_tp4_to_prefill_tp8():
+    assert [get_moriio_remote_tp_rank(rank, 4, 8) for rank in range(4)] == [
+        0,
+        2,
+        4,
+        6,
+    ]
+
+
+def test_remote_tp_rank_rejects_non_multiple_tp_sizes():
+    with pytest.raises(ValueError, match="must be a multiple"):
+        get_moriio_remote_tp_rank(0, 6, 4)
+
+    with pytest.raises(ValueError, match="must be a multiple"):
+        get_moriio_remote_tp_rank(0, 4, 6)
+
+
+def test_plain_ack_resolves_without_tp_suffix():
+    ack = parse_moriio_transfer_ack("transfer-a")
+    counts = {}
+    completed = set()
+
+    assert resolve_moriio_transfer_ack(
+        ack, 4, {"transfer-a"}, counts, completed
+    ) == "transfer-a"
+    assert counts == {}
+    assert completed == {"transfer-a"}
+
+
+def test_tp_suffixed_ack_waits_for_all_expected_consumers():
+    ack = parse_moriio_transfer_ack("transfer-b:8")
+    counts = {}
+    completed = set()
+
+    assert (
+        resolve_moriio_transfer_ack(ack, 4, {"transfer-b"}, counts, completed)
+        is None
+    )
+    assert counts == {"transfer-b": 1}
+    assert completed == set()
+
+    assert resolve_moriio_transfer_ack(
+        ack, 4, {"transfer-b"}, counts, completed
+    ) == "transfer-b"
+    assert counts == {}
+    assert completed == {"transfer-b"}
+
+
+def test_duplicate_ack_after_completion_does_not_resolve_twice():
+    ack = parse_moriio_transfer_ack("transfer-c:8")
+    counts = {}
+    completed = set()
+
+    assert (
+        resolve_moriio_transfer_ack(ack, 4, {"transfer-c"}, counts, completed)
+        is None
+    )
+    assert resolve_moriio_transfer_ack(
+        ack, 4, {"transfer-c"}, counts, completed
+    ) == "transfer-c"
+    assert resolve_moriio_transfer_ack(
+        ack, 4, {"transfer-c"}, counts, completed
+    ) is None
