@@ -39,6 +39,8 @@ class Mxfp8TritonExpertsBase(TritonExperts):
         super().__init__(moe_config, quant_config)
         self.w1_scale_val = self.quant_config.w1_scale
         self.w2_scale_val = self.quant_config.w2_scale
+        assert self.w1_scale_val is not None
+        assert self.w2_scale_val is not None
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
 
