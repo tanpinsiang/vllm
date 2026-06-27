@@ -251,21 +251,26 @@ class MiniMaxM3MLP(nn.Module):
         return x
 
 
-def _m3_fused_shared_experts_enabled() -> bool:
-    """Fuse M3's always-on shared expert into the routed MoE call.
-
-    Enabled by default on gfx950 with AITER: the shared expert becomes the last
-    expert slot, selected on every token at a fixed weight of 1.0 (one
-    129-expert / topk-5 grouped call instead of a separate per-layer MLP).
-    Mirrors ATOM.
-
-    Hints aiter that the model wants fused shared experts (which gates
-    ``num_fused_shared_experts`` in the MoE layer); an explicit
-    VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS override still wins.
-    """
+def _m3_shared_expert_fusion_supported(config: PretrainedConfig) -> bool:
+    """Whether MiniMax-M3 can append shared experts as routed expert slots."""
     from vllm.platforms import current_platform
 
-    if not (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER):
+    return bool(
+        current_platform.is_rocm()
+        and getattr(config, "n_shared_experts", None)
+        and not get_current_vllm_config().parallel_config.enable_expert_parallel
+    )
+
+
+def _m3_aiter_fused_shared_experts_enabled(config: PretrainedConfig) -> bool:
+    """Whether MiniMax-M3 should use AITER's grouped-topk FSE path.
+
+    This is intentionally separate from ``_fse_topk_bias_router_enabled``:
+    router-level shared-expert fusion also works in the non-AITER topk-bias
+    router path, while this helper only controls AITER's grouped-topk routing
+    and its fused shared-expert kernel hint.
+    """
+    if not (_m3_shared_expert_fusion_supported(config) and envs.VLLM_ROCM_USE_AITER):
         return False
     from vllm.platforms.rocm import on_gfx950
 
@@ -273,7 +278,25 @@ def _m3_fused_shared_experts_enabled() -> bool:
         return False
 
     rocm_aiter_ops.set_fusion_moe_shared_experts_enabled()
-    return rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+    return bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
+
+
+def _fse_topk_bias_router_enabled(
+    config: PretrainedConfig, aiter_fse_enabled: bool | None = None
+) -> bool:
+    """Whether MiniMax-M3 should fuse shared experts in the router path.
+
+    ROCm only. The non-AITER topk-bias router path is enabled via
+    ``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS``. The AITER path may also
+    enable the same router-level FSE through the model hint above, while an
+    explicit env override still wins. Expert parallelism is unsupported because
+    the EP expert-map path does not handle the appended shared slot.
+    """
+    if not _m3_shared_expert_fusion_supported(config):
+        return False
+    if aiter_fse_enabled is None:
+        aiter_fse_enabled = _m3_aiter_fused_shared_experts_enabled(config)
+    return bool(envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS or aiter_fse_enabled)
 
 
 class MiniMaxM3MoE(nn.Module):
@@ -324,8 +347,12 @@ class MiniMaxM3MoE(nn.Module):
         # When shared-expert fusion is enabled, the shared expert is folded into
         # the routed MoE call as the last expert slot (its weights load into that
         # slot), so we don't build a separate module.
+        aiter_fse_enabled = _m3_aiter_fused_shared_experts_enabled(config)
+        fse_topk_bias_router_enabled = _fse_topk_bias_router_enabled(
+            config, aiter_fse_enabled
+        )
         self.fuse_shared_experts = bool(
-            self.n_shared_experts and _m3_fused_shared_experts_enabled()
+            self.n_shared_experts and fse_topk_bias_router_enabled
         )
 
         self.shared_experts: MiniMaxM3MLP | None = None
@@ -338,11 +365,10 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        # The fused path reuses vLLM's standard shared-expert fusion via
-        # GroupedTopKRouter (as in DeepSeek-V4): M3 is not group-routed, so a
-        # trivial single group (num_expert_group=topk_group=1) reduces to plain
-        # top-k while going through aiter's biased grouped-topk (sigmoid + bias
-        # correction) and appending the always-on shared expert.
+        # Router-level FSE appends the always-on shared expert for both vLLM's
+        # topk-bias router and AITER. Only the AITER FSE path uses the grouped
+        # topk knobs; M3 is not group-routed, so the single group reduces to
+        # plain top-k while selecting AITER's biased grouped-topk router.
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -352,14 +378,15 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             renormalize=True,
-            use_grouped_topk=self.fuse_shared_experts,
-            num_expert_group=1 if self.fuse_shared_experts else None,
-            topk_group=1 if self.fuse_shared_experts else None,
+            use_grouped_topk=aiter_fse_enabled,
+            num_expert_group=1 if aiter_fse_enabled else None,
+            topk_group=1 if aiter_fse_enabled else None,
             activation="swigluoai_uninterleave",
             swiglu_limit=config.swiglu_limit,
             swiglu_alpha=config.swiglu_alpha,
             swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             n_shared_experts=(
@@ -913,7 +940,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # their (synthesized) ``experts.{N+j}`` weights map into the widened
         # expert tensors.
         num_experts = self.config.num_local_experts
-        if _m3_fused_shared_experts_enabled() and self.config.n_shared_experts:
+        if _fse_topk_bias_router_enabled(self.config) and self.config.n_shared_experts:
             num_experts += self.config.n_shared_experts
         return fused_moe_make_expert_params_mapping(
             self,
@@ -949,7 +976,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # slot; redirect its checkpoint weights there. M3 has a single shared
         # expert (n_shared_experts == 1), so it maps to slot num_local_experts.
         fuse_shared_experts = bool(
-            _m3_fused_shared_experts_enabled() and self.config.n_shared_experts
+            _fse_topk_bias_router_enabled(self.config) and self.config.n_shared_experts
         )
         shared_slot = self.config.num_local_experts
 
@@ -965,20 +992,21 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
 
-            # Fuse the shared expert into the routed expert tensors: rewrite
-            # ``...shared_experts.{gate,up,down}_proj...`` to the synthesized
-            # ``...experts.{shared_slot}.{w1,w3,w2}...`` so it flows through the
-            # expert weight loader (gate->w1, up->w3, down->w2).
-            if fuse_shared_experts and "shared_experts" in name:
+            # MXFP4 and MXFP8 checkpoints store the shared expert under
+            # ``shared_experts.{gate,up,down}_proj``. FSE widens the routed
+            # expert tensors with a synthetic trailing expert slot, so redirect
+            # those exact shared-expert keys into ``experts.{shared_slot}``
+            # before dense gate/up stacking can match them.
+            if fuse_shared_experts and ".shared_experts." in name:
                 for src, dst in (
                     ("gate_proj", "w1"),
                     ("up_proj", "w3"),
                     ("down_proj", "w2"),
                 ):
-                    if f"shared_experts.{src}" in name:
+                    if f".shared_experts.{src}." in name:
                         name = name.replace(
-                            f"shared_experts.{src}",
-                            f"experts.{shared_slot}.{dst}",
+                            f".shared_experts.{src}.",
+                            f".experts.{shared_slot}.{dst}.",
                         )
                         break
 
