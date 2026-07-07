@@ -83,23 +83,15 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.minimax_m3 import (
+    minimax_m3_sparse_attention_layer_ids,
+)
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
-
-
-def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
-    """Layer ids whose attention runs the extra sparse "index" branch."""
-    cfg = getattr(config, "sparse_attention_config", None)
-    if not cfg:
-        return set()
-    freq = cfg.get("sparse_attention_freq")
-    if freq is None:
-        return set()
-    return {i for i, f in enumerate(freq) if f != 0}
 
 
 def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
@@ -668,7 +660,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         is_sparse_attention_layer = (
-            force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
+            force_sparse_attn
+            or layer_id in minimax_m3_sparse_attention_layer_ids(config)
         )
 
         if is_sparse_attention_layer:

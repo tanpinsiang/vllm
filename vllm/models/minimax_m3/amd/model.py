@@ -98,6 +98,11 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.minimax_m3 import (
+    minimax_m3_should_skip_index_topk,
+    minimax_m3_sparse_attention_layer_ids,
+    minimax_m3_uses_index_topk_reuse,
+)
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -122,48 +127,6 @@ def _fuse_shared_experts_enabled(config: PretrainedConfig) -> bool:
         and envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
         and not get_current_vllm_config().parallel_config.enable_expert_parallel
     )
-
-
-def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
-    """Layer ids whose attention runs the extra sparse "index" branch."""
-    cfg = getattr(config, "sparse_attention_config", None)
-    if not cfg:
-        return set()
-    freq = cfg.get("sparse_attention_freq")
-    if freq is None:
-        return set()
-    return {i for i, f in enumerate(freq) if f != 0}
-
-
-def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
-    """Map each sparse-attention layer id to its ordinal among sparse layers."""
-    return {
-        lid: ordinal
-        for ordinal, lid in enumerate(sorted(_sparse_attention_layer_ids(config)))
-    }
-
-
-def _should_skip_index_topk(config: PretrainedConfig, layer_id: int) -> bool:
-    """ATOM ``index_topk_freq`` (cross-layer index sharing).
-
-    Only 1 of every ``index_topk_freq`` sparse-attention layers recomputes the
-    lightning-indexer top-k block selection; the rest reuse the selection the
-    preceding compute layer wrote into the shared ``topk_indices_buffer`` this
-    same forward pass. This cuts the indexer score + top-k cost ~``freq``x with
-    negligible accuracy impact (adjacent sparse layers pick nearly the same
-    blocks; ATOM validated GSM8K with freq=4). Gated by ``use_index_cache``;
-    enable via ``--hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'``.
-    """
-    if not getattr(config, "use_index_cache", False):
-        return False
-    freq = int(getattr(config, "index_topk_freq", 1) or 1)
-    if freq <= 1:
-        return False
-    ordinal = _sparse_attention_layer_ordinals(config).get(layer_id)
-    if ordinal is None:
-        return False
-    offset = int(getattr(config, "index_skip_topk_offset", 0) or 0)
-    return max(ordinal - offset, 0) % freq != 0
 
 
 def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
@@ -576,7 +539,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # layer reuses the previous compute layer's top-k block selection from the
         # shared topk_indices_buffer instead of recomputing it. Static per layer
         # -> cudagraph-capture-safe.
-        self.skip_index_topk = _should_skip_index_topk(config, layer_id)
+        self.skip_index_topk, self.sparse_layer_ordinal = (
+            minimax_m3_should_skip_index_topk(config, layer_id)
+        )
+        if self.skip_index_topk and self.sparse_layer_ordinal == 0:
+            raise ValueError("MiniMax-M3 first sparse layer cannot skip index top-k")
 
         # Sparse "index" branch dims. index_q has the same head count as the KV
         # heads (sparse_num_index_heads == num_key_value_heads), so it shards
@@ -791,7 +758,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.layer_id = layer_id
 
         is_sparse_attention_layer = (
-            force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
+            force_sparse_attn
+            or layer_id in minimax_m3_sparse_attention_layer_ids(config)
         )
 
         if is_sparse_attention_layer:
@@ -891,6 +859,14 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # prefill block selection into it, the attend reads it back.
         sparse_cfg = getattr(config, "sparse_attention_config", None)
         if sparse_cfg is not None:
+            if (
+                minimax_m3_uses_index_topk_reuse(config)
+                and get_pp_group().world_size > 1
+            ):
+                raise NotImplementedError(
+                    "MiniMax-M3 index top-k reuse is only supported without "
+                    "pipeline parallelism."
+                )
             tp_size = get_tensor_model_parallel_world_size()
             num_index_heads = max(1, sparse_cfg["sparse_num_index_heads"] // tp_size)
             self.topk_indices_buffer = torch.empty(

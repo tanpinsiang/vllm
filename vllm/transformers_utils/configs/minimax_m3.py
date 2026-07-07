@@ -4,6 +4,13 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
+_MINIMAX_M3_INDEX_TOPK_CONFIG_FIELDS = (
+    "use_index_cache",
+    "index_topk_freq",
+    "index_topk_pattern",
+    "index_skip_topk_offset",
+)
+
 
 class MiniMaxM3TextConfig(PretrainedConfig):
     """Config for the MiniMax M3 text backbone (MiniMaxM3SparseForCausalLM).
@@ -50,6 +57,10 @@ class MiniMaxM3TextConfig(PretrainedConfig):
         num_mtp_modules: int = 1,
         moe_layer_freq: list[int] | None = None,
         sparse_attention_config: dict[str, Any] | None = None,
+        use_index_cache: bool = False,
+        index_topk_freq: int = 1,
+        index_topk_pattern: list[str] | None = None,
+        index_skip_topk_offset: int = 0,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -82,6 +93,10 @@ class MiniMaxM3TextConfig(PretrainedConfig):
         self.use_routing_bias = use_routing_bias
         self.routed_scaling_factor = routed_scaling_factor
         self.num_mtp_modules = num_mtp_modules
+        self.use_index_cache = use_index_cache
+        self.index_topk_freq = index_topk_freq
+        self.index_topk_pattern = index_topk_pattern
+        self.index_skip_topk_offset = index_skip_topk_offset
         # First 3 layers are dense; the remaining 57 are sparse MoE.
         self.moe_layer_freq = (
             moe_layer_freq if moe_layer_freq is not None else [0] * 3 + [1] * 57
@@ -147,3 +162,81 @@ class MiniMaxM3Config(PretrainedConfig):
         self.hidden_size = text_config.hidden_size
 
         super().__init__(**kwargs)
+
+    def get_text_config(self, *args, **kwargs) -> PretrainedConfig:
+        for field in _MINIMAX_M3_INDEX_TOPK_CONFIG_FIELDS:
+            if hasattr(self, field):
+                setattr(self.text_config, field, getattr(self, field))
+        return self.text_config
+
+
+def minimax_m3_sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
+    """Layer ids whose attention runs the MiniMax-M3 sparse index branch."""
+    cfg = getattr(config, "sparse_attention_config", None)
+    if not cfg:
+        return set()
+    freq = cfg.get("sparse_attention_freq")
+    if freq is None:
+        return set()
+    return {i for i, enabled in enumerate(freq) if enabled != 0}
+
+
+def _minimax_m3_sparse_attention_layer_ordinals(
+    config: PretrainedConfig,
+) -> dict[int, int]:
+    """Map each sparse-attention layer id to its ordinal among sparse layers."""
+    return {
+        layer_id: ordinal
+        for ordinal, layer_id in enumerate(
+            sorted(minimax_m3_sparse_attention_layer_ids(config))
+        )
+    }
+
+
+def minimax_m3_uses_index_topk_reuse(config: PretrainedConfig) -> bool:
+    """Whether MiniMax-M3 is configured to reuse top-k across sparse layers."""
+    if not getattr(config, "use_index_cache", False):
+        return False
+
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return any(entry == "S" for entry in index_topk_pattern)
+
+    index_topk_freq_value = getattr(config, "index_topk_freq", 1)
+    index_topk_freq = 1 if index_topk_freq_value is None else int(index_topk_freq_value)
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    return index_topk_freq > 1
+
+
+def minimax_m3_should_skip_index_topk(
+    config: PretrainedConfig, layer_id: int
+) -> tuple[bool, int]:
+    """Return whether a sparse layer should reuse the previous top-k result.
+
+    MiniMax-M3 schedules index sharing by sparse-layer ordinal, not absolute
+    decoder layer id. This matches ATOM's ``use_index_cache`` behavior.
+    """
+    sparse_ordinals = _minimax_m3_sparse_attention_layer_ordinals(config)
+    sparse_ordinal = sparse_ordinals.get(layer_id, -1)
+    if sparse_ordinal < 0:
+        return False, sparse_ordinal
+    if not getattr(config, "use_index_cache", False):
+        return False, sparse_ordinal
+
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        if 0 <= sparse_ordinal < len(index_topk_pattern):
+            return index_topk_pattern[sparse_ordinal] == "S", sparse_ordinal
+        return False, sparse_ordinal
+
+    index_topk_freq_value = getattr(config, "index_topk_freq", 1)
+    index_topk_freq = 1 if index_topk_freq_value is None else int(index_topk_freq_value)
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    if index_topk_freq == 1:
+        return False, sparse_ordinal
+
+    offset_value = getattr(config, "index_skip_topk_offset", 0)
+    offset = 0 if offset_value is None else int(offset_value)
+    return max(sparse_ordinal - offset, 0) % index_topk_freq != 0, sparse_ordinal
