@@ -9,9 +9,12 @@ expert_mask) and skipped (native fallback) when the device/package is missing.
 """
 
 import dataclasses
+import sys
+import types
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.platforms import current_platform
 
@@ -133,3 +136,69 @@ def test_explicit_moe_backend_aiter():
         pytest.raises(ValueError, match="flydsl package"),
     ):
         _select_kernel_cls(Fp8MoeBackend.AITER_MXFP8, _config(1))
+
+
+@pytest.mark.parametrize("output_is_view", [False, True])
+def test_aiter_mxfp8_elides_output_copy_when_safe(monkeypatch, output_is_view):
+    """Owning outputs reuse the AITER result; views retain copy semantics."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    def _enum_value(value):
+        return types.SimpleNamespace(value=value)
+
+    fake_aiter = types.ModuleType("aiter")
+    fake_aiter.__dict__["ActivationType"] = types.SimpleNamespace(Swiglu=_enum_value(1))
+    fake_aiter.__dict__["QuantType"] = types.SimpleNamespace(per_1x32=_enum_value(2))
+    fake_aiter_ops = types.ModuleType("aiter.ops")
+    fake_flydsl = types.ModuleType("aiter.ops.flydsl")
+    fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+    fake_moe_common.__dict__["GateMode"] = types.SimpleNamespace(
+        INTERLEAVE=_enum_value("interleave")
+    )
+    monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
+    monkeypatch.setitem(sys.modules, "aiter.ops", fake_aiter_ops)
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", fake_flydsl)
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.moe_common", fake_moe_common)
+
+    experts = object.__new__(AiterMxfp8Experts)
+    experts.moe_config = types.SimpleNamespace(rocm_aiter_fmoe_enabled=False)
+    experts.quant_config = types.SimpleNamespace(gemm1_clamp_limit=None)
+    experts.w1_scale_val = None
+    experts.w2_scale_val = None
+
+    result = torch.randn(4, 16, dtype=torch.bfloat16)
+    output_storage = torch.empty(8 if output_is_view else 4, 16, dtype=result.dtype)
+    output = output_storage[:4] if output_is_view else output_storage
+    original_output_ptr = output.data_ptr()
+
+    def _fake_fused_moe(*args, **kwargs):
+        assert kwargs["output_dtype"] == output.dtype
+        return result
+
+    monkeypatch.setattr(rocm_aiter_ops, "fused_moe", _fake_fused_moe)
+
+    experts.apply(
+        output=output,
+        hidden_states=torch.empty_like(result),
+        w1=torch.empty(1),
+        w2=torch.empty(1),
+        topk_weights=torch.ones(4, 2),
+        topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+        activation=None,
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=torch.empty(0),
+        workspace2=torch.empty(0),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    if output_is_view:
+        assert output.data_ptr() == original_output_ptr
+        assert output.data_ptr() != result.data_ptr()
+    else:
+        assert output.data_ptr() == result.data_ptr()
+        assert output.data_ptr() != original_output_ptr
+    assert torch.equal(output, result)
