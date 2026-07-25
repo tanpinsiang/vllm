@@ -292,7 +292,7 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker.world_size = 8
     worker.moriio_wrapper = FakeWrapper()
-    worker._recving_transfers = {"req": [DoneStatus()]}
+    worker._recving_transfers = {"req": {"layer0": DoneStatus()}}
     worker._recving_transfers_callback_addr = {
         "req": ("127.0.0.1", "7000", "tx-release")
     }
@@ -303,6 +303,73 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
             "tx-release",
             "127.0.0.1",
             "7000",
+            "release",
+            {"consumer_tp_size": 8},
+        )
+    ]
+    assert worker._recving_transfers == {}
+    assert worker._recving_transfers_callback_addr == {}
+
+
+def test_read_completion_waits_for_every_layer_before_forward():
+    class Status:
+        def __init__(self, done_after=0):
+            self.done_after = done_after
+            self.polls = 0
+
+        def Succeeded(self):
+            self.polls += 1
+            return self.polls > self.done_after
+
+        def Failed(self):
+            return False
+
+    class FakeWrapper:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.sent = []
+
+        def send_notify(
+            self,
+            transfer_id,
+            host,
+            port,
+            message_type=None,
+            message_fields=None,
+        ):
+            self.sent.append((transfer_id, message_type, message_fields))
+
+        def shutdown(self):
+            pass
+
+    pending = Status(done_after=1)
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.READ
+    worker.world_size = 8
+    worker.moriio_wrapper = FakeWrapper()
+    worker.moriio_config = type("Config", (), {"transfer_timeout": 1.0})()
+    worker.layer_name_to_local_kv_cache_metadata = {
+        "layer0": object(),
+        "layer1": object(),
+    }
+    worker.transfer_id_to_request_id = {"tx-release": "req"}
+    worker._recving_transfers = {"req": {"layer0": Status(), "layer1": pending}}
+    worker._recving_transfers_callback_addr = {
+        "req": ("127.0.0.1", "7000", "tx-release")
+    }
+
+    worker.wait_for_all_loads({"req"})
+    assert pending.polls >= 2
+    assert worker.moriio_wrapper.sent == []
+    assert "req" in worker._recving_transfers
+
+    # READ uses a synchronous pre-forward barrier, so completion performs
+    # cleanup but is not reported to the scheduler as an async receive.
+    assert worker.get_finished() == (set(), set())
+    assert worker.moriio_wrapper.sent == [
+        (
+            "tx-release",
             "release",
             {"consumer_tp_size": 8},
         )

@@ -139,6 +139,20 @@ def _write_consumer_scheduler_for_finished_request(tp_size: int = 2):
     return scheduler
 
 
+def test_read_mode_uses_synchronous_pre_forward_load():
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.is_producer = False
+    scheduler.mode = MoRIIOMode.READ
+    request = MagicMock(prompt_token_ids=list(range(33)))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, False)
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, False)
+
+
+def test_read_mode_keeps_full_cudagraph_available():
+    assert not MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": True})
+
+
 class FakeMoRIIOWrapper:
     # A fake MoRIIOWrapper for testing purposes
     def __init__(self, *args, **kwargs):

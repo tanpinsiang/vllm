@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import zmq
 
-from vllm.config import KVTransferConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -187,12 +187,6 @@ def resolve_moriio_transfer_ack(
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
-    @classmethod
-    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
-        # READ needs PIECEWISE for its per-layer barrier; WRITE is unchanged.
-        kv_transfer_config = KVTransferConfig(kv_connector_extra_config=extra_config)
-        return get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -300,6 +294,9 @@ class MoRIIOConnector(KVConnectorBase_V1):
 
         assert isinstance(self._connector_metadata, MoRIIOConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+        self.connector_worker.wait_for_all_loads(
+            set(self._connector_metadata.reqs_to_recv)
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         assert self.connector_worker is not None
@@ -441,8 +438,8 @@ class MoRIIOConnectorScheduler:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         """
-        For remote prefill, pull all prompt blocks from remote
-        asynchronously relative to engine execution.
+        For remote prefill, pull all prompt blocks from remote before engine
+        execution.
 
         Args:
             request (Request): the request object.
@@ -1597,13 +1594,9 @@ class MoRIIOConnectorWorker:
                 self._unmatched_write_completions |= fresh
                 done_recving = self._unmatched_write_completions
             else:
-                # READ mode: the scheduler treats KV loads as synchronous
-                # (load_kv_async=False), so requests go directly to RUNNING
-                # instead of WAITING_FOR_REMOTE_KVS. We still call
-                # _pop_done_transfers() to send the notify to the prefill
-                # side and clean up internal state, but we must NOT report
-                # these as done_recving because the scheduler doesn't
-                # expect a finished_recving signal for RUNNING requests.
+                # READ completion is synchronously gated in pre_forward, so
+                # these requests never enter WAITING_FOR_REMOTE_KVS. Poll here
+                # only to release producer blocks and internal transfer state.
                 self._pop_done_transfers()
 
         done_recving = {
@@ -1624,40 +1617,48 @@ class MoRIIOConnectorWorker:
         return done_sending, done_recving
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until all in-flight READs of this layer have landed."""
-        if self.is_producer or self.mode != MoRIIOMode.READ:
+        pass
+
+    def wait_for_all_loads(self, request_ids: set[ReqId]) -> None:
+        """Wait for every READ posted for this pre-forward batch.
+
+        Keeping this whole-request barrier in ``pre_forward`` preserves full
+        CUDA graph execution while retaining the synchronous scheduler
+        contract used by MoRIIO READ mode.
+        """
+        if self.is_producer or self.mode != MoRIIOMode.READ or not request_ids:
             return
 
+        expected_layers = set(self.layer_name_to_local_kv_cache_metadata)
         deadline = time.monotonic() + self.moriio_config.transfer_timeout
         while True:
             with self.moriio_wrapper.lock:
-                pending = [
-                    status_by_layer[layer_name]
-                    for status_by_layer in self._recving_transfers.values()
-                    if layer_name in status_by_layer
-                ]
+                status_by_request = {
+                    req_id: dict(self._recving_transfers.get(req_id, {}))
+                    for req_id in request_ids
+                }
 
-            if not pending:
-                return
-
-            still_running = False
-            for status in pending:
-                # A failed read is dropped in _pop_done_transfers.
-                if status.Succeeded() or status.Failed():
+            all_done = True
+            for req_id, status_by_layer in status_by_request.items():
+                if set(status_by_layer) != expected_layers:
+                    all_done = False
                     continue
-                still_running = True
+                if any(status.Failed() for status in status_by_layer.values()):
+                    # _pop_done_transfers logs the terminal error and releases
+                    # the producer's blocks after this forward attempt.
+                    continue
+                if not all(status.Succeeded() for status in status_by_layer.values()):
+                    all_done = False
 
-            if not still_running:
+            if all_done:
                 return
-
             if time.monotonic() > deadline:
                 logger.warning(
-                    "MoRIIO READ barrier timed out for layer %s; proceeding "
-                    "(request dropped via get_finished).",
-                    layer_name,
+                    "MoRIIO READ whole-request barrier timed out for requests %s; "
+                    "proceeding (failed requests are dropped by get_finished).",
+                    sorted(request_ids),
                 )
                 return
-
             time.sleep(0.001)
 
     def _pop_done_transfers(self) -> set[str]:
