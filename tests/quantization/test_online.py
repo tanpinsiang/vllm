@@ -3,7 +3,7 @@
 """Tests online quantization."""
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -328,7 +328,7 @@ def test_online_quantization(
     # `LLM.apply_model` requires pickling a function.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-    runner_kwargs = dict(
+    runner_kwargs: dict[str, Any] = dict(
         quantization=quant_scheme,
         enforce_eager=True,
     )
