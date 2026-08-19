@@ -74,6 +74,14 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def dequantize_weight(self, layer: nn.Module) -> torch.Tensor:
+        """Materialize a serialized quantized weight for requantization."""
+        raise NotImplementedError
+
+    def set_requantization_source(self, source_method: "QuantizeMethodBase") -> None:
+        """Configure this method to requantize a serialized source method."""
+        raise NotImplementedError
+
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
     """
@@ -85,6 +93,14 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
     class_embedding = inspect.getattr_static(method_class, "embedding", None)
 
     return class_embedding is not None and class_embedding is not base_embedding
+
+
+def _method_has_implemented(
+    method_class: type[QuantizeMethodBase], method_name: str
+) -> bool:
+    base_method = inspect.getattr_static(QuantizeMethodBase, method_name, None)
+    class_method = inspect.getattr_static(method_class, method_name, None)
+    return class_method is not None and class_method is not base_method
 
 
 class QuantizationConfig(ABC):
@@ -218,27 +234,64 @@ class QuantizationConfig(ABC):
         )
 
         base_quant_method = self.get_quant_method(layer, prefix)
-        if self.online_quant_config is None:
-            return base_quant_method
-        if not isinstance(layer, (LinearBase, RoutedExperts)):
+        # Some out-of-tree and legacy configs do not call this base class's
+        # initializer. Preserve their checkpoint behavior when no online
+        # configuration was attached.
+        online_quant_config = getattr(self, "online_quant_config", None)
+        if online_quant_config is None:
+            # No online configuration: retain the checkpoint method.
             return base_quant_method
 
-        self.online_quant_config.packed_modules_mapping = self.packed_modules_mapping
+        if not isinstance(layer, (LinearBase, RoutedExperts)):
+            # Online quantization applies only to linear and routed MoE layers.
+            return base_quant_method
+
+        online_quant_config.packed_modules_mapping = self.packed_modules_mapping
         checkpoint_is_quantized = base_quant_method is not None and not isinstance(
             base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
         )
-        online_target = self.online_quant_config.get_quantization_target(layer, prefix)
+        online_target = online_quant_config.get_quantization_target(layer, prefix)
         if checkpoint_is_quantized:
-            if online_target is not None:
+            if online_target is None:
+                # The checkpoint owns this quantized layer without an online override.
+                return base_quant_method
+
+            assert base_quant_method is not None
+            target_method_cls = online_target[2]
+            source_can_dequantize = _method_has_implemented(
+                type(base_quant_method), "dequantize_weight"
+            )
+            target_can_requantize = _method_has_implemented(
+                target_method_cls, "set_requantization_source"
+            )
+            if not source_can_dequantize:
                 raise ValueError(
-                    f"Cannot apply requested online quantization {online_target[1]} to "
-                    f"pre-quantized layer {prefix}: {base_quant_method} was already "
-                    "selected by the checkpoint quantization config."
+                    f"Cannot apply requested online quantization {online_target[1]} "
+                    f"to pre-quantized layer {prefix}: "
+                    f"{type(base_quant_method).__name__} does not implement "
+                    f"dequantize_weight for requantization to "
+                    f"{target_method_cls.__name__}."
                 )
-            return base_quant_method
+            if not target_can_requantize:
+                raise ValueError(
+                    f"Cannot apply requested online quantization {online_target[1]} "
+                    f"to pre-quantized layer {prefix}: "
+                    f"{target_method_cls.__name__} does not implement "
+                    f"set_requantization_source for requantization from "
+                    f"{type(base_quant_method).__name__}."
+                )
+
+            online_quant_method = online_quant_config.get_quant_method(layer, prefix)
+            assert online_quant_method is not None
+            online_quant_method.set_requantization_source(base_quant_method)
+            return online_quant_method
+
         if online_target is None:
+            # Keep the checkpoint's unquantized method when online excludes it.
             return base_quant_method
-        return self.online_quant_config.get_quant_method(layer, prefix)
+
+        # Unquantized layer case, with online quantization selected for this layer.
+        return online_quant_config.get_quant_method(layer, prefix)
 
     @staticmethod
     def get_cache_scale_mapper() -> "WeightsMapper":

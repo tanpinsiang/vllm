@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
@@ -35,7 +36,12 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
-from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
+from vllm.model_executor.layers.quantization.humming import HummingConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptFp8Config,
+    ModelOptMxFp8Config,
+    ModelOptMxFp8LinearMethod,
+)
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
@@ -44,6 +50,7 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineMoEMethod,
     Fp8PerTensorOnlineLinearMethod,
     Fp8PerTensorOnlineMoEMethod,
+    Fp8PtpcOnlineLinearMethod,
     _fp8_channel_scale,
     _fp8_quant_per_channel,
     _fp8_scale,
@@ -170,12 +177,36 @@ def _fully_quantized_modelopt_config() -> ModelOptFp8Config:
     )
 
 
+def _fully_quantized_modelopt_mxfp8_config() -> ModelOptMxFp8Config:
+    return ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+
+
 def _moe_only_compressed_tensors_config() -> CompressedTensorsConfig:
     return CompressedTensorsConfig(
         target_scheme_map={"RoutedExperts": {}},
         ignore=[],
         quant_format="pack-quantized",
     )
+
+
+def test_effective_quant_method_supports_config_without_base_init(
+    monkeypatch,
+) -> None:
+    """Legacy configs without super().__init__ retain checkpoint dispatch."""
+    config = HummingConfig()
+    assert not hasattr(config, "online_quant_config")
+    checkpoint_method = Mock()
+    monkeypatch.setattr(
+        config,
+        "get_quant_method",
+        Mock(return_value=checkpoint_method),
+    )
+
+    assert config.get_effective_quant_method(Mock(), "model.layer") is checkpoint_method
 
 
 @pytest.mark.parametrize(
@@ -219,6 +250,57 @@ def test_online_prequantized_compatibility(
     else:
         layer = ColumnParallelLinear(**layer_kwargs)
         assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
+
+
+def test_online_requantization_binds_supported_source_target(
+    default_vllm_config,
+) -> None:
+    """The coordinator binds serialized MXFP8 to the PTPC online target."""
+    default_vllm_config.model_config = ModelConfig()
+    config = _fully_quantized_modelopt_mxfp8_config()
+    config.set_online_quantization(QuantizationConfigArgs(linear="fp8_per_channel"))
+
+    method = config.get_effective_quant_method(
+        Mock(spec=LinearBase), "model.layers.0.self_attn.o_proj"
+    )
+
+    assert isinstance(method, Fp8PtpcOnlineLinearMethod)
+    assert isinstance(method.requantization_source, ModelOptMxFp8LinearMethod)
+    assert not method.uses_meta_device
+
+
+@pytest.mark.parametrize(
+    "online_target", ["fp8_per_tensor", "fp8_per_block", "mxfp4", "mxfp8"]
+)
+def test_online_requantization_rejects_unsupported_target(
+    online_target: str,
+    default_vllm_config,
+) -> None:
+    """A target that cannot consume serialized weights must fail explicitly."""
+    default_vllm_config.model_config = ModelConfig()
+    config = _fully_quantized_modelopt_mxfp8_config()
+    config.set_online_quantization(QuantizationConfigArgs(linear=online_target))
+
+    with pytest.raises(
+        ValueError, match="does not implement set_requantization_source"
+    ):
+        config.get_effective_quant_method(
+            Mock(spec=LinearBase), "model.layers.0.self_attn.o_proj"
+        )
+
+
+def test_online_requantization_rejects_source_without_dequantizer(
+    default_vllm_config,
+) -> None:
+    """A serialized source must expose its reconstruction step."""
+    default_vllm_config.model_config = ModelConfig()
+    config = _fully_quantized_modelopt_config()
+    config.set_online_quantization(QuantizationConfigArgs(linear="fp8_per_channel"))
+
+    with pytest.raises(ValueError, match="does not implement dequantize_weight"):
+        config.get_effective_quant_method(
+            Mock(spec=LinearBase), "model.layers.0.self_attn.o_proj"
+        )
 
 
 def test_online_ignore_keeps_checkpoint_quantization(default_vllm_config, dist_init):
@@ -829,6 +911,35 @@ def test_online_quant_peak_mem(
 ) -> None:
     _test_online_quant_peak_mem_impl(
         "fp8_per_tensor", vllm_runner, caplog_mp_spawn, monkeypatch
+    )
+
+
+@pytest.mark.skipif(
+    not ((on_gfx942() or on_gfx950()) and is_quant_method_supported("fp8")),
+    reason="MXFP8 requantization memory test requires MI300/MI350-class ROCm FP8.",
+)
+def test_modelopt_mxfp8_requantization_peak_mem(
+    vllm_runner,
+    caplog_mp_spawn,
+    monkeypatch,
+) -> None:
+    _test_online_quant_peak_mem_impl(
+        None,
+        vllm_runner,
+        caplog_mp_spawn,
+        monkeypatch,
+        model_name="mgoin/Qwen3-0.6B-MXFP8",
+        runner_kwargs={
+            "quantization_config": {"linear": "fp8_per_channel"},
+            "revision": "ab26a96357ddd5ba9c97d85f933c78eff296cddc",
+        },
+        expected_model_memory_gib=2.0,
+        max_peak_over_model_gib=0.5,
+        expected_log_substring=(
+            "Requantization path: "
+            "ModelOptMxFp8LinearMethod.dequantize_weight -> "
+            "Fp8PtpcOnlineLinearMethod ->"
+        ),
     )
 
 

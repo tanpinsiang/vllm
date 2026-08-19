@@ -25,9 +25,18 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8LinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptMxFp8Config,
+    ModelOptMxFp8LinearMethod,
     ModelOptNvFp4Config,
     ModelOptNvFp4LinearMethod,
     ModelOptNvFp4W4A16LinearMethod,
+)
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    Fp8PtpcOnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
+    dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -267,6 +276,128 @@ def test_modelopt_mixed_precision_does_not_infer_missing_sibling_linear(
     method = config.get_quant_method(fake_layer, missing_prefix)
 
     assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_modelopt_mxfp8_ptpc_loads_dequantizes_and_logs(
+    default_vllm_config,
+    monkeypatch,
+) -> None:
+    """Serialized MXFP8 is reconstructed before PTPC quantization."""
+
+    class FakeKernel:
+        def __init__(self) -> None:
+            self.processed = False
+
+        def process_weights_after_loading(self, layer) -> None:
+            self.processed = True
+
+    default_vllm_config.model_config = ModelConfig()
+    fake_kernel = FakeKernel()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.fp8.init_fp8_linear_kernel",
+        lambda **kwargs: fake_kernel,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+
+    captured: list[torch.Tensor] = []
+
+    def fake_quantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        captured.append(weight.clone())
+        assert scale.shape == (16, 1)
+        return torch.empty_like(weight, dtype=MXFP8_VALUE_DTYPE)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.fp8._fp8_quant_per_channel",
+        fake_quantize,
+    )
+    log = Mock()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.fp8.logger.info_once", log
+    )
+
+    config = ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    source_method = ModelOptMxFp8LinearMethod(config)
+    method = Fp8PtpcOnlineLinearMethod()
+    method.set_requantization_source(source_method)
+    layer = torch.nn.Module()
+
+    method.create_weights(
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[16],
+        input_size=64,
+        output_size=16,
+        params_dtype=torch.bfloat16,
+        weight_loader=MagicMock(),
+    )
+    layer.tp_size = 1
+    layer.input_size = 64
+    layer.output_size = 16
+
+    source_weight = torch.linspace(-1.5, 1.5, 16 * 64).reshape(16, 64)
+    source_weight = source_weight.to(MXFP8_VALUE_DTYPE)
+    source_scale = torch.arange(32, dtype=torch.uint8).reshape(16, 2)
+    source_scale = (source_scale % 3 + 126).to(MXFP8_SCALE_DTYPE)
+    layer.weight.data.copy_(source_weight)
+    layer.weight_scale.data.copy_(source_scale)
+    expected_bf16 = dequant_mxfp8_to_bf16(source_weight, source_scale)
+
+    method.process_weights_after_loading(layer)
+
+    torch.testing.assert_close(captured[0], expected_bf16, rtol=0, atol=0)
+    assert layer.weight.shape == (64, 16)
+    assert layer.weight_scale.shape == (16, 1)
+    assert fake_kernel.processed
+    log.assert_called_once_with(
+        "Requantization path: %s.dequantize_weight -> %s -> %s",
+        "ModelOptMxFp8LinearMethod",
+        "Fp8PtpcOnlineLinearMethod",
+        "FakeKernel",
+    )
+
+
+def test_modelopt_mxfp8_native_path_initializes_lazy_kernel(monkeypatch) -> None:
+    """Native MXFP8 selects its kernel only when loaded weights need it."""
+    config = ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    method = ModelOptMxFp8LinearMethod(config)
+    fake_kernel = Mock()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.init_mxfp8_linear_kernel",
+        lambda: fake_kernel,
+    )
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.empty(2, 32, dtype=MXFP8_VALUE_DTYPE), requires_grad=False
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(
+            torch.empty(2, 1, dtype=MXFP8_SCALE_DTYPE), requires_grad=False
+        ),
+    )
+
+    assert method.kernel is None
+    method.process_weights_after_loading(layer)
+
+    assert method.kernel is fake_kernel
+    fake_kernel.process_weights_after_loading.assert_called_once_with(layer)
 
 
 def test_vocab_parallel_embedding_weight_loader_accepts_scalar_scale():

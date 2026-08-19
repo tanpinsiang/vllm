@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
@@ -29,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
@@ -57,6 +59,8 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.math_utils import round_up
+
+logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Online FP8 Linear Methods
@@ -111,7 +115,7 @@ def _is_tp_sharded(layer: Module, *, reduces_output_dim: bool = True) -> bool:
     return is_row_parallel or (reduces_output_dim and is_column_parallel)
 
 
-class _Fp8OnlineLinearBase(LinearMethodBase):
+class OnlineLinearBase(LinearMethodBase):
     """Shared base for online FP8 linear methods. Loads fp16/bf16 checkpoint
     weights onto meta device and materializes them just-in-time."""
 
@@ -155,7 +159,7 @@ class _Fp8OnlineLinearBase(LinearMethodBase):
         initialize_online_processing(layer)
 
 
-class Fp8PerTensorOnlineLinearMethod(_Fp8OnlineLinearBase):
+class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
     """Online tensorwise FP8 linear quantization.
     Loads fp16/bf16 weights and quantizes them per-tensor during loading."""
 
@@ -256,7 +260,7 @@ class Fp8PerTensorOnlineLinearMethod(_Fp8OnlineLinearBase):
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
-class Fp8PerBlockOnlineLinearMethod(_Fp8OnlineLinearBase):
+class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
     """Online blockwise FP8 linear quantization.
     Loads fp16/bf16 weights and quantizes them per-block during loading."""
 
@@ -336,7 +340,7 @@ class Fp8PerBlockOnlineLinearMethod(_Fp8OnlineLinearBase):
         )
 
 
-class Fp8PtpcOnlineLinearMethod(_Fp8OnlineLinearBase):
+class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
     """Online PTPC FP8 linear quantization.
 
     Per-output-channel weight scale + dynamic per-token activation scale. The
@@ -346,6 +350,15 @@ class Fp8PtpcOnlineLinearMethod(_Fp8OnlineLinearBase):
 
     weight_quant_key = kFp8StaticChannelSym
     activation_quant_key = kFp8DynamicTokenSym
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requantization_source: QuantizeMethodBase | None = None
+
+    def set_requantization_source(self, source_method: QuantizeMethodBase) -> None:
+        """Load serialized source weights before PTPC quantization."""
+        self.requantization_source = source_method
+        self.uses_meta_device = False
 
     def create_weights(
         self,
@@ -357,15 +370,26 @@ class Fp8PtpcOnlineLinearMethod(_Fp8OnlineLinearBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        super().create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
+        if self.requantization_source is None:
+            super().create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+        else:
+            self.requantization_source.create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
 
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
@@ -390,17 +414,30 @@ class Fp8PtpcOnlineLinearMethod(_Fp8OnlineLinearBase):
             return
 
         layer.input_scale = None
-        amax = weight_amax(layer.weight, dim=-1, keepdim=True)
+        weight = (
+            layer.weight
+            if self.requantization_source is None
+            else self.requantization_source.dequantize_weight(layer)
+        )
+        amax = weight_amax(weight, dim=-1, keepdim=True)
         amax = amax_for_tp_weight_quant(
             amax, _is_tp_sharded(layer, reduces_output_dim=False)
         )
         weight_scale = _fp8_channel_scale(amax)
-        qweight = _fp8_quant_per_channel(layer.weight, weight_scale)
+        qweight = _fp8_quant_per_channel(weight, weight_scale)
 
         replace_parameter(layer, "weight", qweight.t())
         replace_parameter(layer, "weight_scale", weight_scale)
 
         self.fp8_linear.process_weights_after_loading(layer)
+
+        if self.requantization_source is not None:
+            logger.info_once(
+                "Requantization path: %s.dequantize_weight -> %s -> %s",
+                type(self.requantization_source).__name__,
+                type(self).__name__,
+                type(self.fp8_linear).__name__,
+            )
 
         layer._already_called_process_weights_after_loading = True
 

@@ -11,6 +11,7 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
+    Mxfp8LinearKernel,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
@@ -67,6 +68,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+    dequant_mxfp8_to_bf16,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -1759,7 +1761,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        self.kernel = init_mxfp8_linear_kernel()
+        self.kernel: Mxfp8LinearKernel | None = None
 
     def create_weights(
         self,
@@ -1824,7 +1826,12 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         if layer.weight.element_size() >= 2:
             return
 
-        # Validate weight tensor
+        self._validate_serialized_weight(layer)
+        self.kernel = init_mxfp8_linear_kernel()
+        self.kernel.process_weights_after_loading(layer)
+
+    @staticmethod
+    def _validate_serialized_weight(layer: torch.nn.Module) -> None:
         if layer.weight.ndim != 2:
             raise ValueError(
                 f"MXFP8 weight must be 2D tensor [N, K], got {layer.weight.ndim}D "
@@ -1847,7 +1854,12 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             f" got {layer.weight_scale.dtype}"
         )
 
-        self.kernel.process_weights_after_loading(layer)
+    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Reconstruct serialized MXFP8 weights for online requantization."""
+        self._validate_serialized_weight(layer)
+        return dequant_mxfp8_to_bf16(
+            layer.weight.contiguous(), layer.weight_scale.contiguous()
+        )
 
     def apply(
         self,
@@ -1855,6 +1867,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        assert self.kernel is not None
         return self.kernel.apply_weights(layer, x, bias)
 
 
