@@ -32,6 +32,102 @@ KV_CACHE_DTYPES = ["auto", "fp8", "fp8_e5m2"]
 OPS = [chunked_prefill_paged_decode, context_attention_fwd]
 
 
+@pytest.mark.parametrize("num_heads", [3, 6])
+@pytest.mark.parametrize("seq_len", [513, 9023])
+@pytest.mark.parametrize("physical_block_size", [400, 784])
+@torch.inference_mode()
+def test_partitioned_stride_padded_hybrid_cache_decode(
+    num_heads: int,
+    seq_len: int,
+    physical_block_size: int,
+) -> None:
+    """Check split-context decode across an inter-block storage stride."""
+    if not current_platform.is_rocm():
+        pytest.skip("The partitioned hybrid-cache path is ROCm-only")
+
+    device = "cuda:0"
+    torch.accelerator.set_device_index(device)
+    set_random_seed(0)
+
+    head_size = 256
+    x = 8
+    num_logical_blocks = math.ceil(seq_len / physical_block_size)
+    num_physical_blocks = num_logical_blocks + 3
+    key_block_elements = head_size * physical_block_size
+    value_block_elements = head_size * physical_block_size
+    padding_elements = 256
+
+    query = torch.randn(1, num_heads, head_size, device=device, dtype=torch.bfloat16)
+    key = torch.randn(seq_len, head_size, device=device, dtype=torch.bfloat16)
+    value = torch.randn(seq_len, head_size, device=device, dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    key_cache = torch.empty_strided(
+        (num_physical_blocks, 1, head_size // x, physical_block_size, x),
+        (
+            key_block_elements + padding_elements,
+            key_block_elements,
+            physical_block_size * x,
+            x,
+            1,
+        ),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    value_cache = torch.empty_strided(
+        (num_physical_blocks, 1, head_size, physical_block_size),
+        (
+            value_block_elements + padding_elements,
+            value_block_elements,
+            physical_block_size,
+            1,
+        ),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key_cache.zero_()
+    value_cache.zero_()
+
+    block_table = torch.randperm(num_physical_blocks, device=device, dtype=torch.int32)[
+        :num_logical_blocks
+    ].view(1, -1)
+    for logical_block in range(num_logical_blocks):
+        start = logical_block * physical_block_size
+        stop = min(start + physical_block_size, seq_len)
+        physical_block = block_table[0, logical_block].item()
+        key_cache[physical_block, 0, :, : stop - start, :].copy_(
+            key[start:stop].view(-1, head_size // x, x).permute(1, 0, 2)
+        )
+        value_cache[physical_block, 0, :, : stop - start].copy_(value[start:stop].T)
+
+    query_start_loc = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    k_scale = v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+    scale = head_size**-0.5
+    chunked_prefill_paged_decode(
+        query=query,
+        key=None,
+        value=None,
+        output=output,
+        kv_cache_dtype="auto",
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len,
+        max_query_len=1,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sm_scale=scale,
+    )
+
+    scores = torch.einsum("qhd,td->qht", query.float(), key.float()) * scale
+    reference = torch.einsum(
+        "qht,td->qhd", torch.softmax(scores, dim=-1), value.float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(output, reference, atol=2e-3, rtol=2e-3)
+
+
 def create_causal_attention_mask_for_sdpa(
     query_lens: list[int],
     seq_lens: list[int],
