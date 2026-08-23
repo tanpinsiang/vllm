@@ -818,6 +818,78 @@ def _w8a8_triton_block_scaled_mm(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def _w8a8_triton_block_scaled_mm_unquantized_m1(
+    # BF16 activation, FP8 weight, output, and weight scales
+    A,
+    B,
+    C,
+    Bs,
+    # Shape and strides
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_bk,
+    stride_bn,
+    stride_Bs_k,
+    stride_Bs_n,
+    # Quantization range
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Fuse dynamic activation quantization into an M=1 block-FP8 GEMM."""
+
+    pid_n = tl.program_id(axis=0)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = k_block * BLOCK_SIZE_K
+        k_offsets = k_start + offs_k
+        activation = tl.load(A + k_offsets, mask=k_offsets < K, other=0.0).to(
+            tl.float32
+        )
+        absmax = tl.maximum(tl.max(tl.abs(activation)), 1.0e-10)
+        activation_scale = absmax * (1.0 / fp8_max)
+        activation_q = tl.clamp(activation / activation_scale, fp8_min, fp8_max).to(
+            B.dtype.element_ty
+        )
+        activation_tile = tl.broadcast_to(
+            activation_q[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        )
+
+        weight_ptrs = B + (k_offsets[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+        weight = tl.load(
+            weight_ptrs,
+            mask=(k_offsets[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        weight_scale = tl.load(
+            Bs + k_block * stride_Bs_k + (offs_n // 128) * stride_Bs_n,
+            mask=offs_n < N,
+            other=0.0,
+        )
+        accumulator += (
+            tl.dot(activation_tile, weight) * activation_scale * weight_scale[None, :]
+        )
+
+    if C.dtype.element_ty == tl.bfloat16:
+        output = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        output = accumulator.to(tl.float16)
+    else:
+        output = accumulator.to(tl.float32)
+
+    output_ptrs = C + offs_m[:, None] * N + offs_n[None, :]
+    output_mask = (offs_m[:, None] == 0) & (offs_n[None, :] < N)
+    tl.store(output_ptrs, output, mask=output_mask)
+
+
 @functools.lru_cache
 def get_w8a8_block_fp8_configs(
     N: int, K: int, block_n: int, block_k: int
@@ -855,6 +927,31 @@ def get_w8a8_block_fp8_configs(
         config_file_path,
     )
     return None
+
+
+@functools.lru_cache
+def get_w8a8_block_fp8_unquantized_configs(
+    N: int, K: int, block_n: int, block_k: int
+) -> dict[int, Any] | None:
+    """Return device-tuned BF16-input M=1 block-FP8 configurations."""
+
+    device_name = get_device_name_as_file_name()
+    json_file_name = (
+        f"N={N},K={K},device_name={device_name},"
+        f"dtype=bf16_w8a8_fused,block_shape=[{block_n},{block_k}].json"
+    )
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    if not os.path.exists(config_file_path):
+        return None
+
+    with open(config_file_path) as f:
+        logger.info(
+            "Using configuration from %s for fused BF16-input block FP8 kernel.",
+            config_file_path,
+        )
+        return {int(key): val for key, val in json.load(f).items()}
 
 
 def w8a8_triton_block_scaled_mm(
@@ -985,6 +1082,67 @@ def w8a8_triton_block_scaled_mm(
         **config,
     )
 
+    return C
+
+
+def w8a8_triton_block_scaled_mm_unquantized(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run a fused BF16-input M=1 block-FP8 GEMM when tuned for the device.
+
+    Unlisted shapes and token counts use the existing dynamic-quantization plus
+    block-scaled GEMM path, preserving the established prefill implementation.
+    """
+
+    assert len(block_size) == 2
+    block_n, block_k = block_size
+    assert block_n == 128 and block_k == 128
+    assert A.ndim == 2 and A.is_contiguous() and A.dtype == torch.bfloat16
+    assert B.ndim == 2 and Bs.ndim == 2
+    assert A.shape[-1] == B.shape[-1]
+
+    M, K = A.shape
+    N = B.shape[0]
+    assert triton.cdiv(N, block_n) == Bs.shape[0]
+    assert triton.cdiv(K, block_k) == Bs.shape[1]
+
+    configs = get_w8a8_block_fp8_unquantized_configs(N, K, block_n, block_k)
+    if M != 1 or configs is None or 1 not in configs:
+        A_q, As = per_token_group_quant_fp8(
+            A,
+            block_k,
+            dtype=current_platform.fp8_dtype(),
+            use_ue8m0=False,
+        )
+        return w8a8_triton_block_scaled_mm(A_q, B, As, Bs, block_size, output_dtype)
+
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+
+    C = A.new_empty((1, N), dtype=output_dtype)
+    config = configs[1]
+    fp8_min, fp8_max = get_fp8_min_max()
+    _w8a8_triton_block_scaled_mm_unquantized_m1[
+        (triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+    ](
+        A,
+        B,
+        C,
+        Bs,
+        N,
+        K,
+        B.stride(1),
+        B.stride(0),
+        Bs.stride(1),
+        Bs.stride(0),
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        **config,
+    )
     return C
 
 
