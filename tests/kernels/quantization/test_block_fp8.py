@@ -22,6 +22,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     w8a8_triton_block_scaled_mm,
+    w8a8_triton_block_scaled_mm_unquantized,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
@@ -156,6 +157,41 @@ def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
         torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
     ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
     assert rel_diff < 0.001
+
+
+@pytest.mark.parametrize("M", [1, 2])
+@torch.inference_mode()
+def test_w8a8_block_fp8_unquantized_matmul(monkeypatch, M):
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+    N, K = 256, 256
+    block_size = [128, 128]
+    torch.manual_seed(M)
+    A = (torch.rand(M, K, dtype=torch.bfloat16) * 4) - 2
+    B = ((torch.rand(N, K, dtype=torch.float32) * 4) - 2).to(
+        current_platform.fp8_dtype()
+    )
+    Bs = torch.rand(N // 128, K // 128, dtype=torch.float32) * 0.02
+    A_q, As = per_token_group_quant_fp8(A, 128, use_ue8m0=False)
+    expected = w8a8_triton_block_scaled_mm(A_q, B, As, Bs, block_size, torch.bfloat16)
+    monkeypatch.setattr(
+        fp8_utils,
+        "get_w8a8_block_fp8_unquantized_configs",
+        lambda *_: {
+            1: {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 128,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
+        },
+    )
+
+    output = w8a8_triton_block_scaled_mm_unquantized(
+        A, B, Bs, block_size, torch.bfloat16
+    )
+    assert torch.allclose(output, expected, atol=0.125, rtol=0.02)
 
 
 @pytest.mark.skipif(

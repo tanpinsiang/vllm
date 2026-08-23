@@ -157,6 +157,28 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
 
 
 class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            get_w8a8_block_fp8_unquantized_configs,
+        )
+
+        activation_group = config.activation_quant_key.scale.group_shape
+        self.use_unquantized_input = (
+            current_platform.is_rocm()
+            and config.input_dtype == torch.bfloat16
+            and config.out_dtype == torch.bfloat16
+            and activation_group.row == 1
+            and activation_group.col == 128
+            and self.weight_group_shape.row == 128
+            and self.weight_group_shape.col == 128
+            and get_w8a8_block_fp8_unquantized_configs(*config.weight_shape, 128, 128)
+            is not None
+        )
+
+    def should_apply_input_quant(self) -> bool:
+        return not self.use_unquantized_input
+
     @classmethod
     def is_supported(cls, compute_capability=None):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
@@ -170,6 +192,14 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        if self.use_unquantized_input:
+            return torch.ops.vllm.w8a8_triton_block_scaled_mm_unquantized_func(
+                A,
+                B,
+                Bs,
+                list(self.weight_group_shape),
+                self.config.out_dtype,
+            )
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,
@@ -217,4 +247,41 @@ direct_register_custom_op(
     "w8a8_triton_block_scaled_mm_func",
     _w8a8_triton_block_scaled_mm_func,
     fake_impl=_w8a8_triton_block_scaled_mm_fake,
+)
+
+
+def _w8a8_triton_block_scaled_mm_unquantized_func(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        w8a8_triton_block_scaled_mm_unquantized,
+    )
+
+    return w8a8_triton_block_scaled_mm_unquantized(
+        input, weight, weight_scale, block_size, output_dtype
+    )
+
+
+def _w8a8_triton_block_scaled_mm_unquantized_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty(
+        (input.size(0), weight.size(0)),
+        dtype=output_dtype,
+        device=input.device,
+    )
+
+
+direct_register_custom_op(
+    "w8a8_triton_block_scaled_mm_unquantized_func",
+    _w8a8_triton_block_scaled_mm_unquantized_func,
+    fake_impl=_w8a8_triton_block_scaled_mm_unquantized_fake,
 )
