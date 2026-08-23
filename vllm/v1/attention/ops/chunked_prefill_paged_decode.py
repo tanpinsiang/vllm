@@ -15,6 +15,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .prefix_prefill import context_attention_fwd
+from .rocm_partitioned_paged_decode import partitioned_paged_attention
 
 logger = init_logger(__name__)
 
@@ -457,6 +458,39 @@ def chunked_prefill_paged_decode(
             )
         else:
             processed_block_table = block_table.to(torch.int32)
+
+        use_partitioned_decode = (
+            max_query_len == 1
+            and num_seqs == 1
+            and not is_pow2
+            and not has_native_layout
+            and head_size == 256
+            and num_kv_heads == 1
+            and num_queries_per_kv in (3, 6)
+            and query.dtype == torch.bfloat16
+            and key_cache.dtype == torch.bfloat16
+            and value_cache.dtype == torch.bfloat16
+            and not use_alibi_slopes
+            and sliding_window == 0
+            and sinks is None
+            and output_scale is None
+            and not is_block_table_ptr
+        )
+        if use_partitioned_decode:
+            logger.info_once(
+                "Using partitioned paged attention for hybrid-cache decode."
+            )
+            partitioned_paged_attention(
+                query,
+                key_cache,
+                value_cache,
+                processed_block_table,
+                seq_lens,
+                query_start_loc,
+                output,
+                sm_scale,
+            )
+            return
 
         kernel_paged_attention_2d[
             (
