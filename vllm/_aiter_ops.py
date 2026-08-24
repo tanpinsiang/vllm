@@ -895,6 +895,37 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     assert aiter_ar is not None, "aiter allreduce must be initialized"
     ca = aiter_ar.aiter_ca
 
+    gcn_arch = getattr(
+        torch.cuda.get_device_properties(input_.device), "gcnArchName", ""
+    )
+    if gcn_arch.startswith("gfx1201"):
+        try:
+            capturing = torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            capturing = False
+        eligible = (
+            capturing
+            and ca.world_size in (4, 8)
+            and input_.dtype == torch.bfloat16
+            and input_.dim() == 2
+            and tuple(input_.shape) == (1, 5120)
+        )
+        if not eligible:
+            from vllm import _custom_ops as ops
+            from vllm.distributed.communication_op import (
+                tensor_model_parallel_all_reduce,
+            )
+
+            allreduce_out = tensor_model_parallel_all_reduce(input_)
+            residual_out = residual.clone()
+            ops.fused_add_rms_norm(
+                allreduce_out,
+                residual_out,
+                weight,
+                epsilon,
+            )
+            return allreduce_out, residual_out
+
     total_bytes = input_.numel() * input_.element_size()
     hidden_dim = input_.shape[-1]
     token_num = input_.numel() // hidden_dim
@@ -1901,9 +1932,10 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._MHA_ENABLED
 
     @classmethod
-    @if_aiter_supported
     def is_custom_all_reduce_enabled(cls) -> bool:
-        return cls._AITER_ENABLED and cls._CUSTOM_ALL_REDUCE_ENABLED
+        cdna_enabled = is_aiter_found_and_supported() and cls._AITER_ENABLED
+        rdna4_enabled = is_aiter_found_and_supported_on_rdna4()
+        return (cdna_enabled or rdna4_enabled) and cls._CUSTOM_ALL_REDUCE_ENABLED
 
     @classmethod
     @if_aiter_supported

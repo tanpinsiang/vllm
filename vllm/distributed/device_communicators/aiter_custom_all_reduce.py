@@ -40,6 +40,8 @@ class AiterCustomAllreduce:
         if max_size is None:
             max_size = self.MAX_SIZE
 
+        gcn_arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+        self._is_gfx1201 = gcn_arch.startswith("gfx1201")
         self._impl = _AiterCustomAllreduce(group, device, max_size=max_size)
 
     @property
@@ -51,6 +53,8 @@ class AiterCustomAllreduce:
         return self._impl.disabled
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        if self._is_gfx1201:
+            return False
         return self._impl.should_custom_ar(inp)
 
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
@@ -72,7 +76,7 @@ class AiterCustomAllreduce:
         skip fusion for unsupported sizes on them.
         Ref (old kernel): https://github.com/ROCm/aiter/blob/6a0e7b26ccf33164785531212cc2ec2cde0b9243/csrc/include/custom_all_reduce.cuh#L2590
         """
-        return hasattr(self._impl, "_pool")
+        return self._is_gfx1201 or hasattr(self._impl, "_pool")
 
     @staticmethod
     def build_supports_per_group_quant() -> bool:
@@ -92,4 +96,4 @@ class AiterCustomAllreduce:
     # TODO(frida-andersson): drop once vLLM pins AITER >= 0.1.14 (ROCm/aiter#2823).
     @property
     def supports_per_group_quant(self) -> bool:
-        return self.build_supports_per_group_quant()
+        return not self._is_gfx1201 and self.build_supports_per_group_quant()

@@ -986,8 +986,13 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        if any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"]):
+            return True
+        if "gfx1201" in _GCN_ARCH:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            return rocm_aiter_ops.is_custom_all_reduce_enabled()
+        return False
 
     @classmethod
     def opaque_attention_op(cls) -> bool:

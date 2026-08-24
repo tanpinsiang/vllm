@@ -187,7 +187,8 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
         from vllm._aiter_ops import rocm_aiter_ops
 
         return (
-            rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
+            rocm_aiter_ops.is_custom_all_reduce_enabled()
+            and cfg.parallel_config.tensor_parallel_size > 1
         )
 
     return (
