@@ -97,3 +97,17 @@ class AiterCustomAllreduce:
     @property
     def supports_per_group_quant(self) -> bool:
         return not self._is_gfx1201 and self.build_supports_per_group_quant()
+
+    @property
+    def supports_rdna4_exact_group_quant(self) -> bool:
+        """Whether the narrow, exact R9700 group-quant path is available.
+
+        The gfx1201 kernel is currently promoted only for four-rank, 5,120-wide
+        decode rows. Keep broader upstream patterns disabled on RDNA4 and let
+        the fusion pass add only that exact shape.
+        """
+        return (
+            self._is_gfx1201
+            and self._impl.world_size == 4
+            and self.build_supports_per_group_quant()
+        )

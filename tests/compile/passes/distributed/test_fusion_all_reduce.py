@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -48,6 +49,34 @@ from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("is_gfx1201", "world_size", "build_support", "expected"),
+    [
+        (True, 4, True, True),
+        (True, 8, True, False),
+        (True, 2, True, False),
+        (False, 4, True, False),
+        (True, 4, False, False),
+    ],
+)
+def test_rdna4_exact_group_quant_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    is_gfx1201: bool,
+    world_size: int,
+    build_support: bool,
+    expected: bool,
+):
+    communicator = object.__new__(AiterCustomAllreduce)
+    communicator._is_gfx1201 = is_gfx1201
+    communicator._impl = SimpleNamespace(world_size=world_size)
+    monkeypatch.setattr(
+        AiterCustomAllreduce,
+        "build_supports_per_group_quant",
+        staticmethod(lambda: build_support),
+    )
+    assert communicator.supports_rdna4_exact_group_quant is expected
 
 
 @pytest.mark.parametrize(

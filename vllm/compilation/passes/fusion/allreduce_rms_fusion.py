@@ -1600,12 +1600,18 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
         # standalone RMS+quant fusion -- still correct, just leaves the
         # post-AR quant as a standalone kernel.
         supports_per_group_quant = ca_comm.supports_per_group_quant
-        if not supports_per_group_quant:
+        supports_rdna4_exact_group_quant = (
+            hidden_dim == 5120 and ca_comm.supports_rdna4_exact_group_quant
+        )
+        if supports_rdna4_exact_group_quant:
+            logger.info_once(
+                "Enabling exact RDNA4 all-reduce RMSNorm group-FP8 quant "
+                "fusion for hidden size 5120."
+            )
+        if not supports_per_group_quant and not supports_rdna4_exact_group_quant:
             logger.warning_once(
-                "AITER AR+RMS+per-group-FP8-quant fusion disabled: aiter "
-                "build is missing 'fused_ar_rms_per_group_quant'. Upgrade "
-                "aiter past PR #2823 to enable the trailing per-group "
-                "FP8 quant fusion."
+                "AITER AR+RMS+per-group-FP8-quant fusion disabled for the "
+                "current build, platform, or topology."
             )
 
         for epsilon in [1e-5, 1e-6]:
@@ -1614,7 +1620,9 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
             # AR+RMS-only fusion runs first and consumes the all_reduce node,
             # leaving the trailing quant op stranded as an unfused kernel.
             # Register larger subgraphs first (DeepSeek indexer fan-out, then
-            # quant-only AR+RMS+quant, then AR+RMS-only).
+            # quant-only AR+RMS+quant, then AR+RMS-only). On RDNA4, register
+            # only the quant-explicit patterns: replacing the BF16-input fused
+            # GEMM changes accumulation semantics and failed the GSM8K gate.
             if supports_per_group_quant:
                 self.register(
                     AiterAllreduceFusedAddRMSNormGroupQuantWithIndexerPattern(
@@ -1623,6 +1631,7 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
                         self.device,
                     )
                 )
+            if supports_per_group_quant or supports_rdna4_exact_group_quant:
                 self.register(
                     AiterAllreduceFusedRMSNormGroupQuantFP8Pattern(
                         epsilon,
