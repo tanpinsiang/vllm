@@ -819,6 +819,70 @@ def _w8a8_triton_block_scaled_mm(
 
 
 @triton.jit
+def _w8a8_triton_block_scaled_mm_prequantized_m1(
+    # FP8 activation/weight, output, and block scales
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    # Shape and strides
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_bk,
+    stride_bn,
+    stride_Bs_k,
+    stride_Bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Run an M=1 block-FP8 GEMM after quantizing its activation once."""
+
+    pid_n = tl.program_id(axis=0)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = k_block * BLOCK_SIZE_K
+        k_offsets = k_start + offs_k
+        activation_q = tl.load(A + k_offsets, mask=k_offsets < K, other=0.0)
+        activation_tile = tl.broadcast_to(
+            activation_q[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        )
+
+        weight_ptrs = B + (k_offsets[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+        weight = tl.load(
+            weight_ptrs,
+            mask=(k_offsets[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        activation_scale = tl.load(As + k_block)
+        weight_scale = tl.load(
+            Bs + k_block * stride_Bs_k + (offs_n // 128) * stride_Bs_n,
+            mask=offs_n < N,
+            other=0.0,
+        )
+        accumulator += (
+            tl.dot(activation_tile, weight) * activation_scale * weight_scale[None, :]
+        )
+
+    if C.dtype.element_ty == tl.bfloat16:
+        output = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        output = accumulator.to(tl.float16)
+    else:
+        output = accumulator.to(tl.float32)
+
+    output_ptrs = C + offs_m[:, None] * N + offs_n[None, :]
+    output_mask = (offs_m[:, None] == 0) & (offs_n[None, :] < N)
+    tl.store(output_ptrs, output, mask=output_mask)
+
+
+@triton.jit
 def _w8a8_triton_block_scaled_mm_unquantized_m1(
     # BF16 activation, FP8 weight, output, and weight scales
     A,
@@ -1123,15 +1187,59 @@ def w8a8_triton_block_scaled_mm_unquantized(
     if Bs.dtype == torch.float8_e8m0fnu:
         Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
 
-    C = A.new_empty((1, N), dtype=output_dtype)
-    config = configs[1]
+    config = dict(configs[1])
+    prequant_input = config.pop("PREQUANT_INPUT", False)
     fp8_min, fp8_max = get_fp8_min_max()
-    _w8a8_triton_block_scaled_mm_unquantized_m1[
+    if not prequant_input:
+        C = A.new_empty((1, N), dtype=output_dtype)
+        _w8a8_triton_block_scaled_mm_unquantized_m1[
+            (triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+        ](
+            A,
+            B,
+            C,
+            Bs,
+            N,
+            K,
+            B.stride(1),
+            B.stride(0),
+            Bs.stride(1),
+            Bs.stride(0),
+            fp8_min=fp8_min,
+            fp8_max=fp8_max,
+            **config,
+        )
+        return C
+
+    A_q = torch.empty_like(A, dtype=B.dtype)
+    As = torch.empty((1, K // block_k), dtype=torch.float32, device=A.device)
+    _per_token_group_quant_fp8[(K // block_k,)](
+        A,
+        A_q,
+        As,
+        block_k,
+        K,
+        A.stride(0),
+        1.0e-10,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        use_ue8m0=False,
+        BLOCK=block_k,
+        num_warps=1,
+        num_stages=1,
+    )
+
+    # Preserve temporary-before-output allocation order.  Reversing it changes
+    # address placement in the captured decode graph and regresses R9700 M=1
+    # projection throughput despite launching the same kernels.
+    C = A.new_empty((1, N), dtype=output_dtype)
+    _w8a8_triton_block_scaled_mm_prequantized_m1[
         (triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     ](
-        A,
+        A_q,
         B,
         C,
+        As,
         Bs,
         N,
         K,
@@ -1139,8 +1247,6 @@ def w8a8_triton_block_scaled_mm_unquantized(
         B.stride(0),
         Bs.stride(1),
         Bs.stride(0),
-        fp8_min=fp8_min,
-        fp8_max=fp8_max,
         **config,
     )
     return C

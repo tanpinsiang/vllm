@@ -159,9 +159,12 @@ def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
     assert rel_diff < 0.001
 
 
-@pytest.mark.parametrize("M", [1, 2])
+@pytest.mark.parametrize(
+    ("M", "prequant_input"),
+    [(1, False), (1, True), (2, False)],
+)
 @torch.inference_mode()
-def test_w8a8_block_fp8_unquantized_matmul(monkeypatch, M):
+def test_w8a8_block_fp8_unquantized_matmul(monkeypatch, M, prequant_input):
     from vllm.model_executor.layers.quantization.utils import fp8_utils
 
     N, K = 256, 256
@@ -174,18 +177,19 @@ def test_w8a8_block_fp8_unquantized_matmul(monkeypatch, M):
     Bs = torch.rand(N // 128, K // 128, dtype=torch.float32) * 0.02
     A_q, As = per_token_group_quant_fp8(A, 128, use_ue8m0=False)
     expected = w8a8_triton_block_scaled_mm(A_q, B, As, Bs, block_size, torch.bfloat16)
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 16,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+    if prequant_input:
+        config["PREQUANT_INPUT"] = True
     monkeypatch.setattr(
         fp8_utils,
         "get_w8a8_block_fp8_unquantized_configs",
-        lambda *_: {
-            1: {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 16,
-                "BLOCK_SIZE_K": 128,
-                "num_warps": 4,
-                "num_stages": 2,
-            }
-        },
+        lambda *_: {1: config},
     )
 
     output = w8a8_triton_block_scaled_mm_unquantized(
