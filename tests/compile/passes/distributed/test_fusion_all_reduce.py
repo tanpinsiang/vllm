@@ -52,13 +52,14 @@ DEVICE_TYPE = current_platform.device_type
 
 
 @pytest.mark.parametrize(
-    ("is_gfx1201", "world_size", "build_support", "expected"),
+    ("is_gfx1201", "world_size", "build_support", "disabled", "expected"),
     [
-        (True, 4, True, True),
-        (True, 8, True, False),
-        (True, 2, True, False),
-        (False, 4, True, False),
-        (True, 4, False, False),
+        (True, 4, True, False, True),
+        (True, 8, True, False, False),
+        (True, 2, True, False, False),
+        (False, 4, True, False, False),
+        (True, 4, False, False, False),
+        (True, 4, True, True, False),
     ],
 )
 def test_rdna4_exact_group_quant_gate(
@@ -66,17 +67,20 @@ def test_rdna4_exact_group_quant_gate(
     is_gfx1201: bool,
     world_size: int,
     build_support: bool,
+    disabled: bool,
     expected: bool,
 ):
     communicator = object.__new__(AiterCustomAllreduce)
     communicator._is_gfx1201 = is_gfx1201
-    communicator._impl = SimpleNamespace(world_size=world_size)
+    communicator._world_size = world_size
+    communicator._impl = SimpleNamespace(disabled=disabled)
     monkeypatch.setattr(
         AiterCustomAllreduce,
         "build_supports_per_group_quant",
         staticmethod(lambda: build_support),
     )
     assert communicator.supports_rdna4_exact_group_quant is expected
+    assert communicator.world_size == world_size
 
 
 @pytest.mark.parametrize(

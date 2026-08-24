@@ -42,6 +42,7 @@ class AiterCustomAllreduce:
 
         gcn_arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
         self._is_gfx1201 = gcn_arch.startswith("gfx1201")
+        self._world_size = torch.distributed.get_world_size(group)
         self._impl = _AiterCustomAllreduce(group, device, max_size=max_size)
 
     @property
@@ -51,6 +52,10 @@ class AiterCustomAllreduce:
     @property
     def disabled(self) -> bool:
         return self._impl.disabled
+
+    @property
+    def world_size(self) -> int:
+        return self._world_size
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         if self._is_gfx1201:
@@ -76,7 +81,7 @@ class AiterCustomAllreduce:
         skip fusion for unsupported sizes on them.
         Ref (old kernel): https://github.com/ROCm/aiter/blob/6a0e7b26ccf33164785531212cc2ec2cde0b9243/csrc/include/custom_all_reduce.cuh#L2590
         """
-        return self._is_gfx1201 or hasattr(self._impl, "_pool")
+        return not self.disabled and (self._is_gfx1201 or hasattr(self._impl, "_pool"))
 
     @staticmethod
     def build_supports_per_group_quant() -> bool:
@@ -107,7 +112,8 @@ class AiterCustomAllreduce:
         the fusion pass add only that exact shape.
         """
         return (
-            self._is_gfx1201
-            and self._impl.world_size == 4
+            not self.disabled
+            and self._is_gfx1201
+            and self._world_size == 4
             and self.build_supports_per_group_quant()
         )
