@@ -129,6 +129,10 @@ def _paged_attention_partitions(
                 other=0.0,
                 eviction_policy="evict_last",
             )
+            if key.dtype.is_fp8():
+                key = key.to(query.dtype)
+            if value.dtype.is_fp8():
+                value = value.to(query.dtype)
 
             scores = scale * tl.dot(query, key)
             scores = tl.where(
@@ -235,8 +239,9 @@ def partitioned_paged_attention(
 ) -> None:
     """Run fixed-grid split-context decode.
 
-    The caller must restrict this specialized path to BF16 decode without
-    ALiBi, sinks, sliding window, or FP8 output scaling.
+    The caller must restrict this specialized path to BF16-query decode with
+    BF16 or unit-scale FP8 KV cache and without ALiBi, sinks, sliding window,
+    or FP8 output scaling.
     """
     num_seqs = len(seq_lens)
     num_query_heads = query.shape[1]

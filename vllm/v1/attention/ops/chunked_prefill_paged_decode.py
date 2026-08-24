@@ -306,6 +306,7 @@ def chunked_prefill_paged_decode(
     sinks=None,
     is_block_table_ptr: bool = False,
     causal: bool = True,
+    unit_kv_scale: bool = False,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
@@ -459,6 +460,13 @@ def chunked_prefill_paged_decode(
         else:
             processed_block_table = block_table.to(torch.int32)
 
+        partitioned_cache_dtype = (
+            key_cache.dtype == value_cache.dtype == torch.bfloat16
+            or (
+                key_cache.dtype == value_cache.dtype == current_platform.fp8_dtype()
+                and unit_kv_scale
+            )
+        )
         use_partitioned_decode = (
             max_query_len == 1
             and num_seqs == 1
@@ -468,8 +476,7 @@ def chunked_prefill_paged_decode(
             and num_kv_heads == 1
             and num_queries_per_kv in (3, 6)
             and query.dtype == torch.bfloat16
-            and key_cache.dtype == torch.bfloat16
-            and value_cache.dtype == torch.bfloat16
+            and partitioned_cache_dtype
             and not use_alibi_slopes
             and sliding_window == 0
             and sinks is None

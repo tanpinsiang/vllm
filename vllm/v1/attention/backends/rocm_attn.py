@@ -477,6 +477,7 @@ class RocmAttentionImpl(AttentionImpl):
             output_scale=output_scale,
             sinks=self.sinks,
             causal=attn_metadata.causal,
+            unit_kv_scale=(layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0),
         )
 
         return output

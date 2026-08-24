@@ -8,6 +8,9 @@ import torch.distributed as dist
 
 from vllm._aiter_ops import is_aiter_found, rocm_aiter_ops
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
+from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
+    AiterCustomAllreduce,
+)
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
 from vllm.envs import disable_envs_cache
 from vllm.platforms import current_platform
@@ -20,7 +23,7 @@ from ..utils import (
     multi_process_parallel,
 )
 
-pytestmark = pytest.mark.skipif(
+rocm_only = pytest.mark.skipif(
     not current_platform.is_rocm(),
     reason="ROCm-only AITER custom allreduce tests",
 )
@@ -49,6 +52,58 @@ def _assert_aiter_handles_input(inp: torch.Tensor) -> None:
     assert aiter_ar_comm.should_custom_ar(inp), (
         f"AITER CustomAllreduce does not support input shape {inp.shape}."
     )
+
+
+class _FakeAiterCustomAllreduce:
+    def __init__(self) -> None:
+        self.should_calls = 0
+        self.custom_calls: list[dict[str, bool]] = []
+
+    def should_custom_ar(self, _inp: torch.Tensor) -> bool:
+        self.should_calls += 1
+        return True
+
+    def custom_all_reduce(self, _inp: torch.Tensor, **kwargs):
+        self.custom_calls.append(kwargs)
+        return None
+
+
+@pytest.mark.parametrize(
+    ("capturing", "dtype", "shape", "tp4_decode", "expected"),
+    [
+        (True, torch.bfloat16, (1, 5120), True, True),
+        (False, torch.bfloat16, (1, 5120), True, False),
+        (True, torch.float16, (1, 5120), True, False),
+        (True, torch.bfloat16, (2, 5120), True, False),
+        (True, torch.bfloat16, (1, 5120), False, False),
+    ],
+)
+def test_gfx1201_custom_ar_is_restricted_to_captured_tp4_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    capturing: bool,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    tp4_decode: bool,
+    expected: bool,
+) -> None:
+    comm = object.__new__(AiterCustomAllreduce)
+    comm._is_gfx1201 = True
+    comm._gfx1201_tp4_decode = tp4_decode
+    comm._impl = _FakeAiterCustomAllreduce()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+
+    assert comm.should_custom_ar(torch.empty(shape, dtype=dtype)) is expected
+    assert comm._impl.should_calls == int(expected)
+
+
+def test_gfx1201_tp4_custom_ar_forces_new_aiter_kernel() -> None:
+    comm = object.__new__(AiterCustomAllreduce)
+    comm._gfx1201_tp4_decode = True
+    comm._impl = _FakeAiterCustomAllreduce()
+
+    comm.custom_all_reduce(torch.empty((1, 5120), dtype=torch.bfloat16))
+
+    assert comm._impl.custom_calls == [{"use_new": True}]
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -121,6 +176,7 @@ def eager_allreduce(
 
 
 @pytest.mark.skipif(not is_aiter_found(), reason="AITER is not installed")
+@rocm_only
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize("pipeline_parallel_size", [1])

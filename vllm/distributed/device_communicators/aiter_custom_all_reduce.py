@@ -9,6 +9,7 @@ the fused allreduce+RMSNorm path share a single AITER instance with its IPC buff
 """
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm.logger import init_logger
@@ -40,7 +41,34 @@ class AiterCustomAllreduce:
         if max_size is None:
             max_size = self.MAX_SIZE
 
-        self._impl = _AiterCustomAllreduce(group, device, max_size=max_size)
+        gcn_arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+        self._is_gfx1201 = gcn_arch.startswith("gfx1201")
+        world_size = dist.get_world_size(group)
+        supports_match_rccl = bool(
+            getattr(_AiterCustomAllreduce, "supports_match_rccl_semantics", False)
+        )
+        self._gfx1201_tp4_decode = (
+            self._is_gfx1201 and world_size == 4 and supports_match_rccl
+        )
+
+        if self._gfx1201_tp4_decode:
+            self._impl = _AiterCustomAllreduce(
+                group,
+                device,
+                max_size=max_size,
+                match_rccl_semantics=True,
+            )
+        else:
+            self._impl = _AiterCustomAllreduce(group, device, max_size=max_size)
+
+        if self._gfx1201_tp4_decode:
+            logger.info_once(
+                "Restricting AITER custom all-reduce on %s TP4 to captured "
+                "single-token 5,120-wide BF16 decode tensors with RCCL "
+                "reduction semantics.",
+                gcn_arch,
+                scope="global",
+            )
 
     @property
     def aiter_ca(self):
@@ -51,9 +79,25 @@ class AiterCustomAllreduce:
         return self._impl.disabled
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        if self._is_gfx1201:
+            if not self._gfx1201_tp4_decode:
+                return False
+            try:
+                capturing = torch.cuda.is_current_stream_capturing()
+            except RuntimeError:
+                return False
+            return (
+                capturing
+                and inp.dtype == torch.bfloat16
+                and inp.dim() == 2
+                and tuple(inp.shape) == (1, 5120)
+                and self._impl.should_custom_ar(inp)
+            )
         return self._impl.should_custom_ar(inp)
 
     def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
+        if self._gfx1201_tp4_decode:
+            return self._impl.custom_all_reduce(inp, use_new=True)
         return self._impl.custom_all_reduce(inp)
 
     def capture(self):
