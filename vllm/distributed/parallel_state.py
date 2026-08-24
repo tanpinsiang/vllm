@@ -643,12 +643,13 @@ class GroupCoordinator:
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
 
-            from vllm._aiter_ops import rocm_aiter_ops
-
-            if rocm_aiter_ops.is_enabled():
-                aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
-                if aiter_ar is not None:
-                    maybe_aiter_context = aiter_ar.capture()  # type: ignore
+            # AITER custom all-reduce can be enabled independently of the
+            # global AITER kernel selector. Enter its capture context whenever
+            # this communicator owns one so graph replay can consume the
+            # registered input directly instead of copying it to the IPC pool.
+            aiter_ar = getattr(self.device_communicator, "aiter_ar_comm", None)
+            if aiter_ar is not None and not aiter_ar.disabled:
+                maybe_aiter_context = aiter_ar.capture()  # type: ignore
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
