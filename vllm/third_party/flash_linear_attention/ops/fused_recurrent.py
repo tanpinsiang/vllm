@@ -8,11 +8,18 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .op import exp, log
+
+
+_RDNA4_QWEN38_PACKED_DECODE_LAUNCH = (
+    os.environ.get("VLLM_ROCM_RDNA4_QWEN38_GDN_LAUNCH", "0") == "1"
+)
 
 
 @triton.heuristics(
@@ -438,8 +445,18 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
-    num_stages = 3
+    use_rdna4_qwen38_launch = (
+        _RDNA4_QWEN38_PACKED_DECODE_LAUNCH and B == 1 and K == 128 and V == 128
+    )
+    if use_rdna4_qwen38_launch and H == 2 and HV == 6:
+        BV = 4
+        num_stages = 1
+    elif use_rdna4_qwen38_launch and H == 4 and HV == 12:
+        BV = 8
+        num_stages = 3
+    else:
+        BV = min(triton.next_power_of_2(V), 32)
+        num_stages = 3
     num_warps = 1
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
