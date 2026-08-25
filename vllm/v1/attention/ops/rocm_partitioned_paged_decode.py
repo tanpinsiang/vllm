@@ -5,10 +5,17 @@
 
 import torch
 
+from vllm.platforms.rocm import on_rdna4
 from vllm.triton_utils import tl, triton
 
 _PARTITION_SIZE = 128
 _NUM_SPLITS = 64
+_PARTITION_LAUNCH_CONFIG = (
+    {"num_warps": 8, "num_stages": 2, "waves_per_eu": 1} if on_rdna4() else {}
+)
+_REDUCE_LAUNCH_CONFIG = (
+    {"num_warps": 4, "num_stages": 2, "waves_per_eu": 1} if on_rdna4() else {}
+)
 
 
 @triton.jit
@@ -296,6 +303,7 @@ def partitioned_paged_attention(
         stride_v_cache_1=value_cache.stride(1),
         stride_v_cache_2=value_cache.stride(2),
         stride_v_cache_3=value_cache.stride(3),
+        **_PARTITION_LAUNCH_CONFIG,
     )
     _reduce_attention_partitions[(num_seqs, num_query_heads)](
         output_ptr=output,
@@ -315,4 +323,5 @@ def partitioned_paged_attention(
         NUM_SPLITS_PADDED=triton.next_power_of_2(_NUM_SPLITS),
         HEAD_SIZE=head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+        **_REDUCE_LAUNCH_CONFIG,
     )
