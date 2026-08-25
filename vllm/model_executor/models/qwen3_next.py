@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -18,6 +19,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -53,7 +55,9 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.ops.paged_attn import PagedAttention
 
 from .interfaces import (
     EagleModelMixin,
@@ -76,6 +80,80 @@ from .utils import (
 )
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _fused_gated_qk_rope_packed_cache_impl(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rms_norm_eps: float,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
+        fused_qkv_split_qk_norm_rope_cache,
+    )
+
+    _, _, kv_cache, slot_mapping = get_attention_context(layer_name)
+    if slot_mapping is None:
+        shape = (qkv.shape[0], num_heads * head_dim)
+        return qkv.new_zeros(shape), qkv.new_zeros(shape)
+
+    key_cache, value_cache = PagedAttention.split_kv_cache(
+        kv_cache.transpose(0, 1), num_kv_heads, head_dim
+    )
+    cos, sin = cos_sin_cache.chunk(2, dim=-1)
+    q, gate, _, _ = fused_qkv_split_qk_norm_rope_cache(
+        qkv,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        positions,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        is_neox=True,
+        reuse_freqs_front_part=True,
+        attn_output_gate=True,
+        eps=rms_norm_eps,
+        gated_qkv_layout="interleaved",
+        kv_cache_layout="VLLM_HEAD_MAJOR",
+    )
+    return q.view(qkv.shape[0], -1), gate.view(qkv.shape[0], -1)
+
+
+def _fused_gated_qk_rope_packed_cache_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rms_norm_eps: float,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del positions, q_weight, k_weight, cos_sin_cache, num_kv_heads, rms_norm_eps
+    del layer_name
+    shape = (qkv.shape[0], num_heads * head_dim)
+    return qkv.new_empty(shape), qkv.new_empty(shape)
+
+
+direct_register_custom_op(
+    op_name="fused_gated_qk_rope_packed_cache",
+    op_func=_fused_gated_qk_rope_packed_cache_impl,
+    mutates_args=[],
+    fake_impl=_fused_gated_qk_rope_packed_cache_fake,
+)
 
 
 def _should_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
@@ -309,6 +387,13 @@ class Qwen3NextAttention(nn.Module):
             and current_platform.is_cuda()
             and text_only
         )
+        self.use_fused_qk_rope_packed_cache = (
+            self.attn_output_gate
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and current_platform.is_rocm()
+            and text_only
+            and os.getenv("VLLM_ROCM_QWEN3_NEXT_FUSED_QK_CACHE", "0") == "1"
+        )
 
     def _project_qkv_gate(
         self,
@@ -372,8 +457,24 @@ class Qwen3NextAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        attn_output = self.attn(q, k, v)
+        if self.use_fused_qk_rope_packed_cache and qkv.shape[0] == 1:
+            pos = positions[0] if positions.ndim == 2 else positions
+            q, gate = torch.ops.vllm.fused_gated_qk_rope_packed_cache(
+                qkv,
+                pos,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.attn.layer_name,
+            )
+            attn_output = self.attn(q, None, None)
+        else:
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            attn_output = self.attn(q, k, v)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
