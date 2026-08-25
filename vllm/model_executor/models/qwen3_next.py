@@ -103,9 +103,17 @@ def _fused_gated_qk_rope_packed_cache_impl(
         shape = (qkv.shape[0], num_heads * head_dim)
         return qkv.new_zeros(shape), qkv.new_zeros(shape)
 
-    key_cache, value_cache = PagedAttention.split_kv_cache(
-        kv_cache.transpose(0, 1), num_kv_heads, head_dim
-    )
+    if kv_cache.ndim == 4 and kv_cache.shape[-1] == 2 * head_dim:
+        # Unified attention keeps K and V packed in the content dimension:
+        # [blocks, heads, block, 2 * head_dim]. Split it into the NHD views
+        # understood by the fused AITER writer without copying either cache.
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+        kv_cache_layout = "NHD"
+    else:
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache.transpose(0, 1), num_kv_heads, head_dim
+        )
+        kv_cache_layout = "VLLM_HEAD_MAJOR"
     cos, sin = cos_sin_cache.chunk(2, dim=-1)
     q, gate, _, _ = fused_qkv_split_qk_norm_rope_cache(
         qkv,
@@ -125,7 +133,7 @@ def _fused_gated_qk_rope_packed_cache_impl(
         attn_output_gate=True,
         eps=rms_norm_eps,
         gated_qkv_layout="interleaved",
-        kv_cache_layout="VLLM_HEAD_MAJOR",
+        kv_cache_layout=kv_cache_layout,
     )
     return q.view(qkv.shape[0], -1), gate.view(qkv.shape[0], -1)
 
