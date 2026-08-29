@@ -38,6 +38,64 @@ from vllm.utils.platform_utils import get_device_name_as_file_name
 
 logger = init_logger(__name__)
 
+_RDNA4_FP8_M1_FLYDSL_AVAILABLE: bool | None = None
+
+
+def _run_rdna4_fp8_m1_flydsl(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    activation_scales: torch.Tensor,
+    weight_scales: torch.Tensor,
+    output_dtype: torch.dtype,
+    block_size: list[int],
+) -> bool:
+    global _RDNA4_FP8_M1_FLYDSL_AVAILABLE
+
+    if _RDNA4_FP8_M1_FLYDSL_AVAILABLE is False or not current_platform.is_rocm():
+        return False
+
+    from vllm.platforms.rocm import on_rdna4
+
+    if not on_rdna4():
+        return False
+
+    try:
+        from vllm.model_executor.layers.quantization.utils import (
+            rdna4_fp8_m1_flydsl,
+        )
+
+        if not rdna4_fp8_m1_flydsl.supports(
+            activation,
+            weight,
+            activation_scales,
+            weight_scales,
+            output_dtype,
+            block_size,
+        ):
+            return False
+        rdna4_fp8_m1_flydsl.run(
+            activation,
+            weight,
+            output,
+            activation_scales,
+            weight_scales,
+        )
+        if _RDNA4_FP8_M1_FLYDSL_AVAILABLE is None:
+            logger.info_once(
+                "Using R9700 FlyDSL FP8 single-token decode kernel.",
+                scope="process",
+            )
+        _RDNA4_FP8_M1_FLYDSL_AVAILABLE = True
+        return True
+    except Exception as ex:  # noqa: BLE001
+        _RDNA4_FP8_M1_FLYDSL_AVAILABLE = False
+        logger.warning_once(
+            "R9700 FlyDSL FP8 decode kernel unavailable (%s); falling back to Triton.",
+            ex,
+        )
+        return False
+
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
     if isinstance(x, torch.Tensor):
@@ -1099,6 +1157,9 @@ def w8a8_triton_block_scaled_mm(
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
+
+    if _run_rdna4_fp8_m1_flydsl(A, B, C, As, Bs, output_dtype, block_size):
+        return C
 
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:

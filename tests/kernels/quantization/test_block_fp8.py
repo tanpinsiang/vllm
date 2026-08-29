@@ -198,6 +198,133 @@ def test_w8a8_block_fp8_unquantized_matmul(monkeypatch, M, prequant_input):
     assert torch.allclose(output, expected, atol=0.125, rtol=0.02)
 
 
+@pytest.mark.parametrize(
+    ("n", "k"), [(2048, 5120), (4352, 5120), (5120, 2176), (5120, 768)]
+)
+@pytest.mark.parametrize("padded_weight", [False, True])
+@torch.inference_mode()
+def test_rdna4_flydsl_m1_block_fp8(monkeypatch, n, k, padded_weight):
+    if not current_platform.is_rocm():
+        pytest.skip("ROCm-only kernel")
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    if arch != "gfx1201" or "R9700" not in torch.cuda.get_device_name(0):
+        pytest.skip("R9700-tuned kernel")
+    pytest.importorskip("flydsl")
+
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+    torch.manual_seed(17)
+    activation = torch.randint(-32, 33, (1, k), dtype=torch.int8).to(
+        torch.float8_e4m3fn
+    )
+    source_weight = torch.randint(-32, 33, (n, k), dtype=torch.int8).to(
+        torch.float8_e4m3fn
+    )
+    if padded_weight:
+        backing = torch.empty((n, k + 256), dtype=torch.float8_e4m3fn)
+        weight = backing[:, :k]
+        weight.copy_(source_weight)
+    else:
+        weight = source_weight
+    activation_scales = torch.rand((1, k // 128), dtype=torch.float32)
+    weight_scales = torch.rand((n // 128, k // 128), dtype=torch.float32)
+    activation_scales.mul_(0.0195).add_(0.0005)
+    weight_scales.mul_(0.0195).add_(0.0005)
+
+    monkeypatch.setattr(fp8_utils, "_RDNA4_FP8_M1_FLYDSL_AVAILABLE", False)
+    expected = w8a8_triton_block_scaled_mm(
+        activation,
+        weight,
+        activation_scales,
+        weight_scales,
+        [128, 128],
+        torch.bfloat16,
+    )
+    monkeypatch.setattr(fp8_utils, "_RDNA4_FP8_M1_FLYDSL_AVAILABLE", None)
+    actual = w8a8_triton_block_scaled_mm(
+        activation,
+        weight,
+        activation_scales,
+        weight_scales,
+        [128, 128],
+        torch.bfloat16,
+    )
+    torch.cuda.synchronize()
+
+    assert fp8_utils._RDNA4_FP8_M1_FLYDSL_AVAILABLE is True
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+
+    if (n, k, padded_weight) == (2048, 5120, True):
+        from vllm.model_executor.layers.quantization.utils import (
+            rdna4_fp8_m1_flydsl,
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = w8a8_triton_block_scaled_mm(
+                activation,
+                weight,
+                activation_scales,
+                weight_scales,
+                [128, 128],
+                torch.bfloat16,
+            )
+
+        for seed in range(4):
+            activation.copy_(
+                torch.randint(-32, 33, activation.shape, dtype=torch.int8).to(
+                    torch.float8_e4m3fn
+                )
+            )
+            activation_scales.copy_(
+                torch.rand_like(activation_scales).mul_(0.0195).add_(0.0005)
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            monkeypatch.setattr(fp8_utils, "_RDNA4_FP8_M1_FLYDSL_AVAILABLE", False)
+            expected = w8a8_triton_block_scaled_mm(
+                activation,
+                weight,
+                activation_scales,
+                weight_scales,
+                [128, 128],
+                torch.bfloat16,
+            )
+            assert torch.equal(
+                graph_output.view(torch.uint16), expected.view(torch.uint16)
+            ), seed
+
+        def fail_launch(*args, **kwargs):
+            raise RuntimeError("injected FlyDSL launch failure")
+
+        monkeypatch.setattr(rdna4_fp8_m1_flydsl, "run", fail_launch)
+        monkeypatch.setattr(fp8_utils, "_RDNA4_FP8_M1_FLYDSL_AVAILABLE", None)
+        fallback = w8a8_triton_block_scaled_mm(
+            activation,
+            weight,
+            activation_scales,
+            weight_scales,
+            [128, 128],
+            torch.bfloat16,
+        )
+        assert fp8_utils._RDNA4_FP8_M1_FLYDSL_AVAILABLE is False
+        assert torch.equal(fallback.view(torch.uint16), expected.view(torch.uint16))
+
+        prefill_activation = activation.expand(2, -1).contiguous()
+        prefill_scales = activation_scales.expand(2, -1).contiguous()
+        monkeypatch.setattr(fp8_utils, "_RDNA4_FP8_M1_FLYDSL_AVAILABLE", None)
+        prefill_output = w8a8_triton_block_scaled_mm(
+            prefill_activation,
+            weight,
+            prefill_scales,
+            weight_scales,
+            [128, 128],
+            torch.bfloat16,
+        )
+        assert fp8_utils._RDNA4_FP8_M1_FLYDSL_AVAILABLE is None
+        assert prefill_output.shape == (2, n)
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="CUTLASS only supported on CUDA platform."
 )
